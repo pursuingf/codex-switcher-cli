@@ -81,6 +81,10 @@ def get_config_file() -> Path:
     """获取当前 config.toml 文件路径"""
     return get_codex_config_dir() / "config.toml"
 
+def get_bashrc_file() -> Path:
+    """获取当前用户 .bashrc 文件路径"""
+    return get_home_dir() / ".bashrc"
+
 # ============== 颜色配置 ==============
 
 class Colors:
@@ -283,6 +287,88 @@ def merge_migratable_config(target_content: str, incoming_content: str) -> str:
     parts = [part for part in (incoming_shared, target_project_text) if part]
     return '\n\n'.join(parts) + ('\n' if parts else '')
 
+BASHRC_MIGRATION_START = "# Codex Switcher Migration START"
+BASHRC_MIGRATION_END = "# Codex Switcher Migration END"
+
+def shell_function_block(lines: List[str], start_index: int) -> Tuple[List[str], int]:
+    """提取简单 shell 函数块，返回块内容和结束下标"""
+    block: List[str] = []
+    brace_balance = 0
+    seen_open = False
+
+    for index in range(start_index, len(lines)):
+        line = lines[index]
+        block.append(line)
+        brace_balance += line.count('{') - line.count('}')
+        if '{' in line:
+            seen_open = True
+        if seen_open and brace_balance <= 0:
+            return block, index + 1
+
+    return block, len(lines)
+
+def build_migratable_bashrc_fragment(content: str) -> str:
+    """从 .bashrc 提取 Codex Switcher 相关片段"""
+    lines = content.splitlines()
+    output: List[str] = []
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+
+        if stripped.startswith('export CLASH_HOST=') or stripped.startswith('export CLASH_MIXED_PORT='):
+            output.append(line)
+            index += 1
+            continue
+
+        if stripped.startswith('# Codex Switcher'):
+            output.append(line)
+            index += 1
+            continue
+
+        if 'codex-switcher' in line or re.match(r"alias\s+csw=", stripped):
+            output.append(line)
+            index += 1
+            continue
+
+        if re.match(r"^(clashon|clashoff|codex)\s*\(\)\s*\{", stripped):
+            block, index = shell_function_block(lines, index)
+            output.extend(block)
+            continue
+
+        index += 1
+
+    return clean_config_lines(output)
+
+def strip_bashrc_migration_markers(fragment: str) -> str:
+    """移除迁移片段已有的托管标记"""
+    lines = [
+        line for line in fragment.splitlines()
+        if line.strip() not in {BASHRC_MIGRATION_START, BASHRC_MIGRATION_END}
+    ]
+    return clean_config_lines(lines)
+
+def apply_bashrc_migration(target_content: str, incoming_fragment: str) -> str:
+    """向 .bashrc 插入或替换 Codex Switcher 迁移托管块"""
+    fragment = strip_bashrc_migration_markers(incoming_fragment).strip()
+    if not fragment:
+        return target_content
+
+    managed_block = f"{BASHRC_MIGRATION_START}\n{fragment}\n{BASHRC_MIGRATION_END}"
+    pattern = re.compile(
+        rf"{re.escape(BASHRC_MIGRATION_START)}.*?{re.escape(BASHRC_MIGRATION_END)}",
+        re.DOTALL,
+    )
+
+    if pattern.search(target_content):
+        result = pattern.sub(managed_block, target_content)
+    else:
+        base = target_content.rstrip()
+        result = f"{base}\n\n{managed_block}" if base else managed_block
+
+    return result.rstrip() + '\n'
+
 def default_migration_archive_path() -> Path:
     """生成默认迁移包路径"""
     timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
@@ -321,6 +407,19 @@ def export_migration_archive(output_path: str = '') -> dict:
             entries.append(('file', f"codex-switcher/accounts/{account_file.name}", account_file))
     else:
         warnings.append(f"未找到账号存档: {accounts_dir}")
+
+    bashrc_path = get_bashrc_file()
+    if bashrc_path.exists():
+        try:
+            bashrc_fragment = build_migratable_bashrc_fragment(bashrc_path.read_text(encoding='utf-8'))
+            if bashrc_fragment:
+                entries.append(('text', 'shell/bashrc.codex-switcher.sh', bashrc_fragment))
+            else:
+                warnings.append(f".bashrc 未发现 Codex Switcher 相关片段: {bashrc_path}")
+        except Exception as e:
+            warnings.append(f"读取 .bashrc 失败: {e}")
+    else:
+        warnings.append(f"未找到 .bashrc: {bashrc_path}")
 
     if not entries:
         return {
@@ -412,6 +511,7 @@ def import_migration_archive(archive_path: str) -> dict:
         restorable = [
             name for name in names
             if name in {'codex/auth.json', 'codex/config.toml'}
+            or name == 'shell/bashrc.codex-switcher.sh'
             or name.startswith('codex-switcher/accounts/')
         ]
         if not restorable:
@@ -438,6 +538,19 @@ def import_migration_archive(archive_path: str) -> dict:
                 imported_files.append('codex/config.toml')
             else:
                 warnings.append('迁移包中的 config.toml 过滤后为空，已跳过')
+
+        if 'shell/bashrc.codex-switcher.sh' in names:
+            bashrc_path = get_bashrc_file()
+            backup_existing_file(bashrc_path, backup_dir, 'shell/bashrc')
+            target_content = bashrc_path.read_text(encoding='utf-8') if bashrc_path.exists() else ''
+            incoming_fragment = zf.read('shell/bashrc.codex-switcher.sh').decode('utf-8')
+            merged_bashrc = apply_bashrc_migration(target_content, incoming_fragment)
+            if merged_bashrc != target_content:
+                bashrc_path.parent.mkdir(parents=True, exist_ok=True)
+                bashrc_path.write_text(merged_bashrc, encoding='utf-8')
+                imported_files.append('shell/bashrc.codex-switcher.sh')
+            else:
+                warnings.append('迁移包中的 .bashrc 片段为空，已跳过')
 
         accounts_dir = get_accounts_dir()
         account_prefix = 'codex-switcher/accounts/'

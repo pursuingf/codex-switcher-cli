@@ -667,3 +667,116 @@ def test_arg_parser_accepts_export_import_and_existing_delete_flag():
     assert import_args.json is True
     assert delete_args.delete == "1"
     assert delete_args.json is True
+
+
+def test_build_migratable_bashrc_fragment_keeps_codex_related_shell_only():
+    source = '''
+export CLASH_HOST="${CLASH_HOST:-0.0.0.0}"
+export CLASH_MIXED_PORT="${CLASH_MIXED_PORT:-7890}"
+
+clashon() {
+  echo "proxy on"
+}
+
+clashoff() {
+  echo "proxy off"
+}
+
+# Codex Switcher
+export PATH="$PATH:/home/pgroup/.local/bin"
+alias csw="codex-switcher"
+
+codex() {
+  clashon
+  codex-switcher --switch best > /dev/null
+  command codex "$@"
+}
+
+claude() {
+  echo "do not migrate"
+}
+'''
+
+    fragment = cs.build_migratable_bashrc_fragment(source)
+
+    assert "CLASH_HOST" in fragment
+    assert "clashon()" in fragment
+    assert 'alias csw="codex-switcher"' in fragment
+    assert "codex-switcher --switch best" in fragment
+    assert "claude()" not in fragment
+    assert "do not migrate" not in fragment
+
+
+def test_apply_bashrc_migration_replaces_managed_block():
+    target = '''
+export KEEP_ME=1
+
+# Codex Switcher Migration START
+old content
+# Codex Switcher Migration END
+'''
+    incoming = 'alias csw="codex-switcher"\n'
+
+    result = cs.apply_bashrc_migration(target, incoming)
+
+    assert "export KEEP_ME=1" in result
+    assert "old content" not in result
+    assert 'alias csw="codex-switcher"' in result
+    assert result.count("Codex Switcher Migration START") == 1
+
+
+def test_export_migration_archive_includes_filtered_bashrc_fragment(tmp_path, monkeypatch):
+    codex_dir = tmp_path / ".codex"
+    switcher_dir = tmp_path / "codex-switcher"
+    accounts_dir = switcher_dir / "accounts"
+    bashrc_path = tmp_path / ".bashrc"
+    codex_dir.mkdir()
+    accounts_dir.mkdir(parents=True)
+    (codex_dir / "auth.json").write_text('{"tokens": {"id_token": "x"}}\n', encoding="utf-8")
+    bashrc_path.write_text(
+        '# Codex Switcher\nalias csw="codex-switcher"\n\nclaude() { echo no; }\n',
+        encoding="utf-8",
+    )
+    archive_path = tmp_path / "migration.zip"
+
+    monkeypatch.setattr(cs, "get_codex_config_dir", lambda: codex_dir)
+    monkeypatch.setattr(cs, "get_auth_file", lambda: codex_dir / "auth.json")
+    monkeypatch.setattr(cs, "get_switcher_dir", lambda: switcher_dir)
+    monkeypatch.setattr(cs, "get_accounts_dir", lambda: accounts_dir)
+    monkeypatch.setattr(cs, "get_bashrc_file", lambda: bashrc_path)
+
+    result = cs.export_migration_archive(str(archive_path))
+
+    assert result["ok"] is True
+    with zipfile.ZipFile(archive_path) as zf:
+        fragment = zf.read("shell/bashrc.codex-switcher.sh").decode("utf-8")
+    assert 'alias csw="codex-switcher"' in fragment
+    assert "claude" not in fragment
+
+
+def test_import_migration_archive_applies_bashrc_fragment(tmp_path, monkeypatch):
+    codex_dir = tmp_path / ".codex"
+    switcher_dir = tmp_path / "codex-switcher"
+    accounts_dir = switcher_dir / "accounts"
+    bashrc_path = tmp_path / ".bashrc"
+    codex_dir.mkdir()
+    accounts_dir.mkdir(parents=True)
+    bashrc_path.write_text("export KEEP_ME=1\n", encoding="utf-8")
+    archive_path = tmp_path / "migration.zip"
+    with zipfile.ZipFile(archive_path, "w") as zf:
+        zf.writestr("manifest.json", json.dumps({"version": 1}))
+        zf.writestr("shell/bashrc.codex-switcher.sh", 'alias csw="codex-switcher"\n')
+
+    monkeypatch.setattr(cs, "get_codex_config_dir", lambda: codex_dir)
+    monkeypatch.setattr(cs, "get_auth_file", lambda: codex_dir / "auth.json")
+    monkeypatch.setattr(cs, "get_switcher_dir", lambda: switcher_dir)
+    monkeypatch.setattr(cs, "get_accounts_dir", lambda: accounts_dir)
+    monkeypatch.setattr(cs, "get_bashrc_file", lambda: bashrc_path)
+
+    result = cs.import_migration_archive(str(archive_path))
+
+    assert result["ok"] is True
+    bashrc = bashrc_path.read_text(encoding="utf-8")
+    assert "export KEEP_ME=1" in bashrc
+    assert "Codex Switcher Migration START" in bashrc
+    assert 'alias csw="codex-switcher"' in bashrc

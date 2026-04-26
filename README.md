@@ -35,8 +35,11 @@ The migration archive includes:
 - `~/.codex/auth.json`
 - `~/codex-switcher/accounts/auth_*.json`
 - filtered `~/.codex/config.toml`
+- filtered Codex Switcher related snippets from `~/.bashrc`
 
 It excludes local sessions, usage cache, runtime files, backups, and `[projects]` / `[projects."/local/path"]` sections from `config.toml`.
+
+For `.bashrc`, only Codex Switcher related shell snippets are migrated, such as `alias csw`, the `codex()` wrapper, and related `clashon` / proxy defaults when present. The importer writes them into a managed `Codex Switcher Migration` block instead of replacing the whole file.
 
 Migration archives contain login credentials. Treat them like tokens and do not commit or share them.
 
