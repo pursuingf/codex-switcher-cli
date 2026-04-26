@@ -1,0 +1,2813 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Codex Switcher - 跨平台 Codex 账号管理工具
+
+功能:
+  (1) 启动后直接进入账号余量列表
+  (2) 按编号切换已存档账号
+  (3) 在余量页内直接调用官方 codex login 添加账号
+  (4) 自动存档当前登录账号并刷新使用量
+  (0) 退出
+
+支持平台: macOS, Linux, Windows
+"""
+
+import os
+import sys
+import argparse
+import json
+import shlex
+import re
+import shutil
+import subprocess
+import base64
+import platform
+import time
+import zipfile
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+import unicodedata
+from typing import Optional, Dict, List, Tuple, Any
+
+REFRESH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+REFRESH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+REFRESH_LOOKAHEAD_SECONDS = 300
+TOKEN_REFRESH_INTERVAL_DAYS = 8
+USAGE_API_URL = "https://chatgpt.com/backend-api/wham/usage"
+RESTART_DRY_RUN_ENV = "CODEX_SWITCHER_DRY_RUN_RESTART"
+MAX_REFRESH_WORKERS = 6
+LOGIN_FILE_CREDENTIALS_CONFIG = 'cli_auth_credentials_store="file"'
+ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*m')
+WEEKLY_REMAINING_WARNING_THRESHOLD = 20
+MIGRATION_MANIFEST_VERSION = 1
+
+# ============== 跨平台路径配置 ==============
+
+def get_home_dir() -> Path:
+    """获取用户主目录"""
+    return Path.home()
+
+def get_codex_config_dir() -> Path:
+    """获取 Codex 配置目录"""
+    home = get_home_dir()
+    if platform.system() == "Windows":
+        return home / ".codex"
+    else:
+        return home / ".codex"
+
+def get_switcher_dir() -> Path:
+    """获取 Codex Switcher 数据目录"""
+    home = get_home_dir()
+    if platform.system() == "Windows":
+        return home / "codex-switcher"
+    else:
+        return home / "codex-switcher"
+
+def get_accounts_dir() -> Path:
+    """获取账号存档目录"""
+    return get_switcher_dir() / "accounts"
+
+def get_usage_cache_dir() -> Path:
+    """获取使用量缓存目录"""
+    return get_switcher_dir() / "usage_cache"
+
+def get_auth_file() -> Path:
+    """获取当前 auth.json 文件路径"""
+    return get_codex_config_dir() / "auth.json"
+
+def get_config_file() -> Path:
+    """获取当前 config.toml 文件路径"""
+    return get_codex_config_dir() / "config.toml"
+
+# ============== 颜色配置 ==============
+
+class Colors:
+    """终端颜色（跨平台兼容）"""
+    SUPPORTS_COLOR = (
+        hasattr(sys.stdout, 'isatty') and sys.stdout.isatty() and
+        (platform.system() != 'Windows' or 'ANSICON' in os.environ or
+         'WT_SESSION' in os.environ or os.environ.get('TERM') == 'xterm')
+    )
+
+    if SUPPORTS_COLOR:
+        HEADER = '\033[95m'
+        BLUE = '\033[94m'
+        CYAN = '\033[96m'
+        GREEN = '\033[92m'
+        YELLOW = '\033[93m'
+        RED = '\033[91m'
+        ENDC = '\033[0m'
+        BOLD = '\033[1m'
+        DIM = '\033[2m'
+        UNDERLINE = '\033[4m'
+    else:
+        HEADER = BLUE = CYAN = GREEN = YELLOW = RED = ENDC = BOLD = DIM = UNDERLINE = ''
+
+# ============== 工具函数 ==============
+
+def clear_screen():
+    """清屏（跨平台）"""
+    os.system('cls' if platform.system() == 'Windows' else 'clear')
+
+def apply_default_proxy_env() -> bool:
+    """根据 clash 环境变量补齐代理设置"""
+    clash_host = str(os.environ.get('CLASH_HOST', '') or '').strip()
+    clash_port = str(os.environ.get('CLASH_MIXED_PORT', '') or '').strip()
+    if not clash_host or not clash_port:
+        return False
+
+    http_proxy = f"http://{clash_host}:{clash_port}"
+    socks_proxy = f"socks5://{clash_host}:{clash_port}"
+    os.environ['http_proxy'] = http_proxy
+    os.environ['https_proxy'] = http_proxy
+    os.environ['all_proxy'] = socks_proxy
+    os.environ['HTTP_PROXY'] = http_proxy
+    os.environ['HTTPS_PROXY'] = http_proxy
+    os.environ['ALL_PROXY'] = socks_proxy
+    return True
+
+def decode_jwt_payload(token: str) -> Optional[dict]:
+    """解码 JWT token 的 payload 部分"""
+    try:
+        parts = token.split('.')
+        if len(parts) < 2:
+            return None
+        payload = parts[1]
+        padding = 4 - len(payload) % 4
+        if padding != 4:
+            payload += '=' * padding
+        decoded = base64.urlsafe_b64decode(payload)
+        return json.loads(decoded)
+    except Exception:
+        return None
+
+def format_datetime(dt_str: str) -> str:
+    """格式化日期时间"""
+    if not dt_str:
+        return 'N/A'
+    try:
+        dt = datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
+        return dt.strftime('%m-%d %H:%M')
+    except:
+        return dt_str[:16] if len(dt_str) > 16 else dt_str
+
+def time_until_reset(sub_until: str) -> str:
+    """计算到重置还有多久"""
+    if not sub_until:
+        return 'N/A'
+    try:
+        dt = datetime.fromisoformat(sub_until.replace('Z', '+00:00'))
+        now = datetime.now(timezone.utc)
+        delta = dt - now
+
+        if delta.total_seconds() < 0:
+            return "已过期"
+
+        days = delta.days
+        hours = delta.seconds // 3600
+        minutes = (delta.seconds % 3600) // 60
+
+        if days > 0:
+            return f"{days}d{hours}h"
+        elif hours > 0:
+            return f"{hours}h{minutes}m"
+        else:
+            return f"{minutes}m"
+    except:
+        return 'N/A'
+
+def get_token_status(exp: int) -> Tuple[str, str]:
+    """获取 token 状态"""
+    if not exp:
+        return 'unknown', Colors.YELLOW
+
+    now = time.time()
+    remaining = exp - now
+
+    if remaining <= 0:
+        return 'expired', Colors.RED
+    elif remaining < 3600:
+        return 'expiring', Colors.YELLOW
+    else:
+        return 'valid', Colors.GREEN
+
+def sanitize_key(value: str) -> str:
+    """将任意字符串转换为安全文件名"""
+    return "".join(c if c.isalnum() or c in '-_.' else '_' for c in value)
+
+def char_display_width(ch: str) -> int:
+    """计算单个字符在终端中的显示宽度"""
+    if unicodedata.east_asian_width(ch) in ('W', 'F'):
+        return 2
+    return 1
+
+def display_width(text: str) -> int:
+    """计算字符串在终端中的显示宽度"""
+    clean = ANSI_ESCAPE_RE.sub('', text)
+    return sum(char_display_width(ch) for ch in clean)
+
+def truncate_display_text(text: str, max_width: int, suffix: str = '..') -> str:
+    """按终端显示宽度截断字符串"""
+    if display_width(text) <= max_width:
+        return text
+
+    suffix_width = display_width(suffix)
+    width = 0
+    chars = []
+    for ch in text:
+        ch_width = char_display_width(ch)
+        if width + ch_width + suffix_width > max_width:
+            break
+        chars.append(ch)
+        width += ch_width
+    return ''.join(chars) + suffix
+
+def pad_display(text: str, width: int) -> str:
+    """按终端显示宽度右侧补齐空格"""
+    pad = max(0, width - display_width(text))
+    return text + (' ' * pad)
+
+def toml_section_name(line: str) -> str:
+    """提取 TOML section 名称，非 section 行返回空字符串"""
+    stripped = line.strip()
+    if not stripped.startswith('['):
+        return ''
+
+    bracket_count = len(stripped) - len(stripped.lstrip('['))
+    closing = ']' * bracket_count
+    if bracket_count not in (1, 2) or not stripped.endswith(closing):
+        return ''
+
+    return stripped[bracket_count:-bracket_count].strip()
+
+def is_projects_section(section: str) -> bool:
+    """判断 TOML section 是否属于本机 projects 路径配置"""
+    return section == 'projects' or section.startswith('projects.')
+
+def split_config_by_project_sections(content: str) -> Tuple[List[str], List[str]]:
+    """按 section 将 config.toml 拆成可迁移内容与 projects 内容"""
+    migratable: List[str] = []
+    projects: List[str] = []
+    in_projects_section = False
+
+    for line in content.splitlines():
+        section = toml_section_name(line)
+        if section:
+            in_projects_section = is_projects_section(section)
+
+        if in_projects_section:
+            projects.append(line)
+        else:
+            migratable.append(line)
+
+    return migratable, projects
+
+def clean_config_lines(lines: List[str]) -> str:
+    """清理 TOML 行列表首尾空白并确保末尾换行"""
+    text = '\n'.join(lines).strip()
+    return f"{text}\n" if text else ''
+
+def filter_migratable_config(content: str) -> str:
+    """过滤 config.toml，仅保留可迁移的通用配置"""
+    migratable, _ = split_config_by_project_sections(content)
+    return clean_config_lines(migratable)
+
+def merge_migratable_config(target_content: str, incoming_content: str) -> str:
+    """合并迁移配置，保留目标机器 projects 配置"""
+    incoming_shared = filter_migratable_config(incoming_content).strip()
+    _, target_projects = split_config_by_project_sections(target_content)
+    target_project_text = clean_config_lines(target_projects).strip()
+
+    parts = [part for part in (incoming_shared, target_project_text) if part]
+    return '\n\n'.join(parts) + ('\n' if parts else '')
+
+def default_migration_archive_path() -> Path:
+    """生成默认迁移包路径"""
+    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    return Path.cwd() / f"codex-switcher-migration-{timestamp}.zip"
+
+def export_migration_archive(output_path: str = '') -> dict:
+    """导出登录态迁移包"""
+    archive_path = Path(output_path).expanduser() if output_path else default_migration_archive_path()
+    exported_files: List[str] = []
+    warnings: List[str] = []
+    entries: List[Tuple[str, str, Any]] = []
+
+    auth_path = get_auth_file()
+    if auth_path.exists():
+        entries.append(('file', 'codex/auth.json', auth_path))
+    else:
+        warnings.append(f"未找到当前登录文件: {auth_path}")
+
+    config_path = get_config_file()
+    if config_path.exists():
+        try:
+            filtered_config = filter_migratable_config(config_path.read_text(encoding='utf-8'))
+            if filtered_config:
+                entries.append(('text', 'codex/config.toml', filtered_config))
+            else:
+                warnings.append(f"config.toml 过滤后为空: {config_path}")
+        except Exception as e:
+            warnings.append(f"读取 config.toml 失败: {e}")
+    else:
+        warnings.append(f"未找到 config.toml: {config_path}")
+
+    accounts_dir = get_accounts_dir()
+    account_files = sorted(accounts_dir.glob('auth_*.json')) if accounts_dir.exists() else []
+    if account_files:
+        for account_file in account_files:
+            entries.append(('file', f"codex-switcher/accounts/{account_file.name}", account_file))
+    else:
+        warnings.append(f"未找到账号存档: {accounts_dir}")
+
+    if not entries:
+        return {
+            'ok': False,
+            'error': '没有可导出的迁移内容',
+            'archive_path': str(archive_path),
+            'exported_files': [],
+            'warnings': warnings,
+        }
+
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        'version': MIGRATION_MANIFEST_VERSION,
+        'created_at': iso_utc_now(),
+        'tool': 'codex-switcher',
+        'exported_files': [arcname for _, arcname, _ in entries],
+    }
+
+    with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr('manifest.json', json.dumps(manifest, ensure_ascii=False, indent=2))
+        exported_files.append('manifest.json')
+        for entry_type, arcname, payload in entries:
+            if entry_type == 'file':
+                zf.write(payload, arcname)
+            else:
+                zf.writestr(arcname, payload)
+            exported_files.append(arcname)
+
+    return {
+        'ok': True,
+        'archive_path': str(archive_path),
+        'exported_files': exported_files,
+        'warnings': warnings,
+    }
+
+def create_import_backup_dir() -> Path:
+    """创建导入前备份目录"""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_dir = get_switcher_dir() / 'backups' / f"import_{timestamp}"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    return backup_dir
+
+def backup_existing_file(source_path: Path, backup_dir: Path, relative_name: str) -> Optional[Path]:
+    """导入覆盖前备份已有文件"""
+    if not source_path.exists():
+        return None
+
+    backup_path = backup_dir / relative_name
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_path, backup_path)
+    return backup_path
+
+def validate_migration_manifest(zf: zipfile.ZipFile) -> dict:
+    """校验迁移包 manifest"""
+    if 'manifest.json' not in zf.namelist():
+        raise ValueError('迁移包缺少 manifest.json')
+
+    try:
+        manifest = json.loads(zf.read('manifest.json').decode('utf-8'))
+    except Exception as e:
+        raise ValueError(f'manifest.json 无法解析: {e}')
+
+    version = manifest.get('version')
+    if version != MIGRATION_MANIFEST_VERSION:
+        raise ValueError(f'不支持的迁移包版本: {version}')
+    return manifest
+
+def import_migration_archive(archive_path: str) -> dict:
+    """导入登录态迁移包"""
+    path = Path(archive_path).expanduser()
+    imported_files: List[str] = []
+    warnings: List[str] = []
+
+    if not path.exists():
+        return {'ok': False, 'error': f'迁移包不存在: {path}', 'imported_files': [], 'warnings': warnings}
+
+    try:
+        zf = zipfile.ZipFile(path)
+    except zipfile.BadZipFile:
+        return {'ok': False, 'error': '迁移包不是有效 zip 文件', 'imported_files': [], 'warnings': warnings}
+
+    with zf:
+        try:
+            validate_migration_manifest(zf)
+        except ValueError as e:
+            return {'ok': False, 'error': str(e), 'imported_files': [], 'warnings': warnings}
+
+        names = set(zf.namelist())
+        restorable = [
+            name for name in names
+            if name in {'codex/auth.json', 'codex/config.toml'}
+            or name.startswith('codex-switcher/accounts/')
+        ]
+        if not restorable:
+            return {'ok': False, 'error': '迁移包没有可恢复内容', 'imported_files': [], 'warnings': warnings}
+
+        backup_dir = create_import_backup_dir()
+
+        if 'codex/auth.json' in names:
+            auth_path = get_auth_file()
+            backup_existing_file(auth_path, backup_dir, 'codex/auth.json')
+            auth_path.parent.mkdir(parents=True, exist_ok=True)
+            auth_path.write_bytes(zf.read('codex/auth.json'))
+            imported_files.append('codex/auth.json')
+
+        if 'codex/config.toml' in names:
+            config_path = get_config_file()
+            backup_existing_file(config_path, backup_dir, 'codex/config.toml')
+            target_content = config_path.read_text(encoding='utf-8') if config_path.exists() else ''
+            incoming_content = zf.read('codex/config.toml').decode('utf-8')
+            merged_config = merge_migratable_config(target_content, incoming_content)
+            if merged_config:
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                config_path.write_text(merged_config, encoding='utf-8')
+                imported_files.append('codex/config.toml')
+            else:
+                warnings.append('迁移包中的 config.toml 过滤后为空，已跳过')
+
+        accounts_dir = get_accounts_dir()
+        account_prefix = 'codex-switcher/accounts/'
+        for name in sorted(names):
+            if not name.startswith(account_prefix) or name.endswith('/'):
+                continue
+            account_name = name[len(account_prefix):]
+            if (
+                not account_name or
+                '/' in account_name or
+                '\\' in account_name or
+                not account_name.startswith('auth_') or
+                not account_name.endswith('.json')
+            ):
+                warnings.append(f'已跳过不支持的账号存档路径: {name}')
+                continue
+
+            target_path = accounts_dir / account_name
+            backup_existing_file(target_path, backup_dir, f"codex-switcher/accounts/{account_name}")
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(zf.read(name))
+            imported_files.append(name)
+
+    if not imported_files:
+        return {
+            'ok': False,
+            'error': '迁移包没有成功恢复任何内容',
+            'archive_path': str(path),
+            'backup_dir': str(backup_dir),
+            'imported_files': [],
+            'warnings': warnings,
+        }
+
+    return {
+        'ok': True,
+        'archive_path': str(path),
+        'backup_dir': str(backup_dir),
+        'imported_files': imported_files,
+        'warnings': warnings,
+    }
+
+def parse_iso_datetime(dt_str: str) -> Optional[datetime]:
+    """解析 ISO 时间字符串"""
+    if not dt_str:
+        return None
+    try:
+        return datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
+    except Exception:
+        return None
+
+def iso_utc_now() -> str:
+    """返回当前 UTC 时间字符串"""
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+def extract_claims_from_id_token(id_token: str) -> Optional[dict]:
+    """从 id_token 提取 claims"""
+    payload = decode_jwt_payload(id_token)
+    if not payload:
+        return None
+    auth_info = payload.get('https://api.openai.com/auth', {})
+    email = payload.get('email', 'Unknown')
+    chatgpt_user_id = auth_info.get('chatgpt_user_id', '') or auth_info.get('user_id', '')
+    account_id = auth_info.get('chatgpt_account_id', '')
+    record_key = ''
+    if chatgpt_user_id and account_id:
+        record_key = f"{chatgpt_user_id}::{account_id}"
+
+    return {
+        'payload': payload,
+        'auth_info': auth_info,
+        'email': email,
+        'chatgpt_user_id': chatgpt_user_id,
+        'chatgpt_account_id': account_id,
+        'record_key': record_key,
+    }
+
+def normalize_organizations(auth_info: dict) -> List[dict]:
+    """标准化 workspace/organization 信息"""
+    raw_orgs = auth_info.get('organizations', [])
+    if not isinstance(raw_orgs, list):
+        return []
+
+    organizations = []
+    for raw_org in raw_orgs:
+        if not isinstance(raw_org, dict):
+            continue
+        organizations.append({
+            'id': str(raw_org.get('id', '') or '').strip(),
+            'title': str(raw_org.get('title', '') or '').strip(),
+            'role': str(raw_org.get('role', '') or '').strip(),
+            'is_default': bool(raw_org.get('is_default')),
+        })
+    return organizations
+
+def get_primary_workspace(organizations: List[dict]) -> dict:
+    """优先选择默认 workspace，其次取第一个"""
+    for org in organizations:
+        if org.get('is_default'):
+            return org
+    return organizations[0] if organizations else {}
+
+def format_workspace_display(organizations: List[dict], primary: dict) -> str:
+    """格式化 SPACE 列展示文本"""
+    if not primary:
+        return '-'
+
+    label = primary.get('title') or primary.get('id') or '-'
+    extra_count = max(0, len(organizations) - 1)
+    if extra_count:
+        return f"{label} (+{extra_count})"
+    return label
+
+def get_usage_cache_key(email: str, account_id: str = '', record_key: str = '') -> str:
+    """生成 usage 缓存 key"""
+    if record_key:
+        return sanitize_key(record_key)
+    if email and account_id:
+        return sanitize_key(f"{email}__{account_id}")
+    if email:
+        return sanitize_key(email)
+    if account_id:
+        return sanitize_key(account_id)
+    return 'unknown'
+
+def list_processes() -> List[Tuple[int, str]]:
+    """列出当前用户进程"""
+    try:
+        result = subprocess.run(
+            ['ps', '-axo', 'pid=,command='],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return []
+
+    processes = []
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            pid_text, command = line.split(None, 1)
+            processes.append((int(pid_text), command))
+        except ValueError:
+            continue
+    return processes
+
+def list_windows_processes() -> List[dict]:
+    """列出 Windows 进程信息"""
+    if platform.system() != 'Windows':
+        return []
+
+    script = (
+        "Get-CimInstance Win32_Process | "
+        "Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine | "
+        "ConvertTo-Json -Compress"
+    )
+    try:
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-Command', script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return []
+
+    if result.returncode != 0:
+        return []
+
+    raw = result.stdout.strip()
+    if not raw:
+        return []
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+
+    processes = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        try:
+            pid = int(item.get('ProcessId') or 0)
+            ppid = int(item.get('ParentProcessId') or 0)
+        except Exception:
+            continue
+        if pid <= 0:
+            continue
+
+        processes.append({
+            'pid': pid,
+            'ppid': ppid,
+            'name': str(item.get('Name') or ''),
+            'exe_path': str(item.get('ExecutablePath') or ''),
+            'command_line': str(item.get('CommandLine') or ''),
+        })
+    return processes
+
+def list_process_tree() -> Dict[int, Tuple[int, str]]:
+    """列出当前用户进程树"""
+    try:
+        result = subprocess.run(
+            ['ps', '-axo', 'pid=,ppid=,command='],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return {}
+
+    tree: Dict[int, Tuple[int, str]] = {}
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            pid_text, ppid_text, command = line.split(None, 2)
+            tree[int(pid_text)] = (int(ppid_text), command)
+        except ValueError:
+            continue
+    return tree
+
+def get_process_cwd(pid: int) -> str:
+    """获取进程当前工作目录"""
+    try:
+        result = subprocess.run(
+            ['lsof', '-a', '-p', str(pid), '-d', 'cwd', '-Fn'],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return str(get_home_dir())
+
+    for line in result.stdout.splitlines():
+        if line.startswith('n') and len(line) > 1:
+            return line[1:]
+    return str(get_home_dir())
+
+def detect_codex_desktop_instances() -> List[dict]:
+    """检测运行中的 Codex Desktop 主进程"""
+    if platform.system() == 'Windows':
+        instances = []
+        for proc in list_windows_processes():
+            exe_path = (proc.get('exe_path') or '').replace('/', '\\')
+            command = proc.get('command_line', '')
+            if not exe_path.lower().endswith('\\app\\codex.exe'):
+                continue
+            if '\\resources\\codex.exe' in exe_path.lower():
+                continue
+            if '--type=' in command:
+                continue
+            instances.append({
+                'pid': proc['pid'],
+                'app_path': exe_path,
+            })
+        return instances
+
+    instances = []
+    for pid, command in list_processes():
+        if '/Contents/MacOS/Codex' not in command:
+            continue
+        if 'Codex Helper' in command:
+            continue
+        if 'codex-switcher.py' in command:
+            continue
+
+        app_path = command.split('/Contents/MacOS/Codex', 1)[0]
+        if app_path.endswith('.app'):
+            instances.append({
+                'pid': pid,
+                'app_path': app_path,
+            })
+    return instances
+
+def detect_codex_cli_instances() -> List[dict]:
+    """检测运行中的 codex CLI 进程"""
+    if platform.system() == 'Windows':
+        return []
+
+    tree = list_process_tree()
+    instances = []
+    for pid, (ppid, command) in tree.items():
+        binary = command.split(' ', 1)[0]
+        if os.path.basename(binary) != 'codex':
+            continue
+        if '/Applications/Codex.app/Contents/Resources/codex' in command:
+            continue
+        if pid == os.getpid():
+            continue
+        if process_is_managed_by_codex_desktop(pid, tree):
+            continue
+
+        instances.append({
+            'pid': pid,
+            'command': command,
+            'cwd': get_process_cwd(pid),
+        })
+    return instances
+
+def process_is_managed_by_codex_desktop(
+    pid: int,
+    tree: Dict[int, Tuple[int, str]],
+) -> bool:
+    """判断进程是否属于 Codex Desktop 进程树"""
+    visited = set()
+    current = pid
+
+    while current and current not in visited:
+        visited.add(current)
+        node = tree.get(current)
+        if not node:
+            return False
+        parent_pid, command = node
+        if '/Applications/Codex.app/' in command:
+            return True
+        current = parent_pid
+
+    return False
+
+def escape_applescript_string(value: str) -> str:
+    """转义 AppleScript 字符串"""
+    return value.replace('\\', '\\\\').replace('"', '\\"')
+
+def escape_powershell_string(value: str) -> str:
+    """转义 PowerShell 单引号字符串"""
+    return value.replace("'", "''")
+
+def collect_windows_restart_targets(desktop_instances: List[dict]) -> List[str]:
+    """收集 Windows 下需要关闭的 Codex 可执行文件路径"""
+    targets = []
+    seen = set()
+    for item in desktop_instances:
+        app_path = str(item.get('app_path') or '')
+        if not app_path:
+            continue
+
+        for candidate in [app_path, str(Path(app_path).parent / 'resources' / 'codex.exe')]:
+            normalized = candidate.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            targets.append(candidate)
+    return targets
+
+def build_restart_script(
+    script_path: Path,
+    desktop_instances: List[dict],
+    cli_instances: List[dict],
+) -> str:
+    """构建重启脚本内容"""
+    lines = [
+        '#!/bin/zsh',
+        'sleep 1',
+    ]
+
+    desktop_pids = [str(item['pid']) for item in desktop_instances]
+    cli_pids = [str(item['pid']) for item in cli_instances]
+    if desktop_pids:
+        lines.append(f"kill -TERM {' '.join(desktop_pids)} >/dev/null 2>&1 || true")
+    if cli_pids:
+        lines.append(f"kill -TERM {' '.join(cli_pids)} >/dev/null 2>&1 || true")
+
+    lines.append('sleep 1')
+
+    for item in desktop_instances:
+        lines.append(f"open -na {shlex.quote(item['app_path'])} >/dev/null 2>&1 || true")
+
+    lines.append(f"rm -f {shlex.quote(str(script_path))}")
+    return '\n'.join(lines) + '\n'
+
+def build_windows_restart_script(script_path: Path, desktop_instances: List[dict]) -> str:
+    """构建 Windows PowerShell 重启脚本"""
+    desktop_pids = [str(int(item['pid'])) for item in desktop_instances if item.get('pid')]
+    restart_paths = []
+    seen_paths = set()
+    for item in desktop_instances:
+        app_path = str(item.get('app_path') or '')
+        if not app_path:
+            continue
+        normalized = app_path.lower()
+        if normalized in seen_paths:
+            continue
+        seen_paths.add(normalized)
+        restart_paths.append(app_path)
+
+    target_paths = collect_windows_restart_targets(desktop_instances)
+    escaped_target_paths = ', '.join(
+        f"'{escape_powershell_string(path)}'" for path in target_paths
+    ) or "''"
+    escaped_restart_paths = ', '.join(
+        f"'{escape_powershell_string(path)}'" for path in restart_paths
+    ) or "''"
+    escaped_script_path = escape_powershell_string(str(script_path))
+
+    lines = [
+        "$ErrorActionPreference = 'SilentlyContinue'",
+        "Start-Sleep -Seconds 1",
+        f"$desktopPids = @({', '.join(desktop_pids)})" if desktop_pids else "$desktopPids = @()",
+        f"$targetPaths = @({escaped_target_paths})",
+        f"$restartPaths = @({escaped_restart_paths})",
+        "foreach ($pid in $desktopPids) { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue }",
+        "$lookup = @{}",
+        "foreach ($path in $targetPaths) { if ($path) { $lookup[$path.ToLowerInvariant()] = $true } }",
+        "Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $lookup.ContainsKey($_.ExecutablePath.ToLowerInvariant()) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+        "Start-Sleep -Seconds 1",
+        "foreach ($path in $restartPaths) { if ($path -and (Test-Path -LiteralPath $path)) { Start-Process -FilePath $path | Out-Null } }",
+        f"Remove-Item -LiteralPath '{escaped_script_path}' -Force -ErrorAction SilentlyContinue",
+    ]
+    return '\r\n'.join(lines) + '\r\n'
+
+def schedule_codex_restart() -> Tuple[bool, bool, str]:
+    """安排后台重启运行中的 Codex Desktop 和 CLI"""
+    current_platform = platform.system()
+    if current_platform not in {'Darwin', 'Windows'}:
+        return False, False, '自动重启目前仅支持 macOS 和 Windows'
+
+    desktop_instances = detect_codex_desktop_instances()
+    cli_instances = detect_codex_cli_instances()
+    if not desktop_instances and not cli_instances:
+        return False, False, '未检测到运行中的 Codex 客户端或 Codex CLI'
+
+    runtime_dir = get_switcher_dir() / 'runtime'
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    if current_platform == 'Windows':
+        script_path = runtime_dir / f"restart_codex_{int(time.time())}.ps1"
+        script_path.write_text(
+            build_windows_restart_script(script_path, desktop_instances),
+            encoding='utf-8',
+        )
+    else:
+        script_path = runtime_dir / f"restart_codex_{int(time.time())}.sh"
+        script_path.write_text(
+            build_restart_script(script_path, desktop_instances, cli_instances),
+            encoding='utf-8',
+        )
+        script_path.chmod(0o700)
+
+    dry_run = os.environ.get(RESTART_DRY_RUN_ENV) == '1'
+    if dry_run:
+        message = (
+            f"[dry-run] 将关闭 Codex 客户端及相关 CLI 进程，"
+            f"并重启 {len(desktop_instances)} 个 Codex 客户端，会话脚本: {script_path}"
+        )
+        return True, True, message
+
+    if current_platform == 'Windows':
+        subprocess.Popen(
+            ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(script_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
+    else:
+        subprocess.Popen(
+            ['/bin/zsh', str(script_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    message = (
+        f"已安排关闭 Codex 客户端及相关 CLI 进程，并重启 {len(desktop_instances)} 个 Codex 客户端"
+    )
+    return True, False, message
+
+def finish_switch_with_restart(quiet: bool = False) -> dict:
+    """切换账号后安排自动重启"""
+    scheduled, dry_run, message = schedule_codex_restart()
+    if scheduled:
+        if not quiet:
+            print(f"{Colors.DIM}  {message}{Colors.ENDC}")
+            if not dry_run:
+                print(f"{Colors.DIM}  正在关闭并重启 Codex 客户端，请稍候...{Colors.ENDC}")
+        return {'scheduled': True, 'dry_run': dry_run, 'message': message}
+
+    if not quiet:
+        print(f"{Colors.YELLOW}  {message}{Colors.ENDC}")
+        print(f"{Colors.DIM}  提示: 请重启 Codex 或新开终端使登录生效{Colors.ENDC}")
+    return {'scheduled': False, 'dry_run': False, 'message': message}
+
+# ============== 使用量缓存 ==============
+
+def get_usage_cache_file(email: str, account_id: str = '', record_key: str = '') -> Path:
+    """获取使用量缓存文件路径"""
+    cache_key = get_usage_cache_key(email, account_id, record_key)
+    return get_usage_cache_dir() / f"usage_{cache_key}.json"
+
+def load_usage_cache(email: str, account_id: str = '', record_key: str = '') -> Optional[dict]:
+    """加载使用量缓存"""
+    candidates = [get_usage_cache_file(email, account_id, record_key)]
+    legacy_cache = get_usage_cache_dir() / f"usage_{sanitize_key(email)}.json" if email else None
+    if legacy_cache and legacy_cache not in candidates:
+        candidates.append(legacy_cache)
+
+    for cache_file in candidates:
+        if not cache_file.exists():
+            continue
+        try:
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            # 检查缓存是否过期（5分钟）
+            if time.time() - data.get('timestamp', 0) > 300:
+                continue
+            return data
+        except Exception:
+            continue
+    return None
+
+def save_usage_cache(email: str, usage_data: dict, account_id: str = '', record_key: str = ''):
+    """保存使用量缓存"""
+    cache_dir = get_usage_cache_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = get_usage_cache_file(email, account_id, record_key)
+    payload = dict(usage_data)
+    payload['timestamp'] = time.time()
+    payload['email'] = email
+    payload['account_id'] = account_id
+    payload['record_key'] = record_key
+    try:
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2)
+    except Exception:
+        pass
+
+# ============== Auth 快照读写 ==============
+
+def load_auth_data_from_path(auth_path: Path) -> Optional[dict]:
+    """加载指定 auth 文件"""
+    if not auth_path.exists():
+        return None
+    try:
+        with open(auth_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def save_auth_data_to_path(auth_path: Path, auth_data: dict) -> bool:
+    """保存指定 auth 文件"""
+    try:
+        auth_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(auth_path, 'w', encoding='utf-8') as f:
+            json.dump(auth_data, f, indent=2)
+            f.write('\n')
+        return True
+    except Exception:
+        return False
+
+def merge_refreshed_tokens(auth_data: dict, refreshed_tokens: dict) -> dict:
+    """将刷新后的 token 合并到 auth 数据"""
+    merged = dict(auth_data)
+    tokens = dict(merged.get('tokens', {}))
+    claims = extract_claims_from_id_token(refreshed_tokens.get('id_token', '') or tokens.get('id_token', ''))
+
+    for key in ('id_token', 'access_token', 'refresh_token'):
+        value = refreshed_tokens.get(key)
+        if value:
+            tokens[key] = value
+
+    account_id = refreshed_tokens.get('account_id')
+    if not account_id and claims:
+        account_id = claims.get('chatgpt_account_id', '')
+    if account_id:
+        tokens['account_id'] = account_id
+
+    merged['tokens'] = tokens
+    merged['last_refresh'] = iso_utc_now()
+    return merged
+
+def mirror_auth_tokens_to_path(auth_path: Path, refreshed_auth_data: dict) -> bool:
+    """将刷新后的 token 字段同步到其他同账号文件"""
+    existing = load_auth_data_from_path(auth_path)
+    if not existing:
+        return False
+    merged = merge_refreshed_tokens(existing, refreshed_auth_data.get('tokens', {}))
+    if refreshed_auth_data.get('last_refresh'):
+        merged['last_refresh'] = refreshed_auth_data.get('last_refresh')
+    return save_auth_data_to_path(auth_path, merged)
+
+def parse_refresh_error(body: str) -> Tuple[str, str]:
+    """解析 refresh token 错误"""
+    backend_code = ''
+    message = 'token 刷新失败'
+    try:
+        payload = json.loads(body) if body else {}
+    except Exception:
+        payload = {}
+
+    if isinstance(payload, dict):
+        error = payload.get('error')
+        if isinstance(error, dict):
+            backend_code = str(error.get('code', '') or '')
+        elif isinstance(error, str):
+            backend_code = error
+        backend_code = backend_code.lower()
+        message = str(
+            payload.get('error_description')
+            or payload.get('message')
+            or payload.get('detail')
+            or message
+        )
+
+    if backend_code == 'refresh_token_expired':
+        return 'reauth', 'refresh token 已过期'
+    if backend_code == 'refresh_token_reused':
+        return 'reauth', 'refresh token 已被轮换'
+    if backend_code == 'refresh_token_invalidated':
+        return 'reauth', 'refresh token 已失效'
+    return 'error', message
+
+def refresh_tokens_via_oauth(refresh_token: str) -> Tuple[Optional[dict], str]:
+    """通过 OpenAI OAuth 刷新 token"""
+    payload = json.dumps({
+        'client_id': REFRESH_CLIENT_ID,
+        'grant_type': 'refresh_token',
+        'refresh_token': refresh_token,
+    }).encode('utf-8')
+    headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'User-Agent': 'codex-switcher',
+    }
+    req = urllib.request.Request(REFRESH_TOKEN_URL, data=payload, headers=headers, method='POST')
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        refreshed = {
+            'id_token': data.get('id_token', ''),
+            'access_token': data.get('access_token', ''),
+            'refresh_token': data.get('refresh_token', ''),
+        }
+        if not any(refreshed.values()):
+            return None, 'empty_refresh_response'
+        return refreshed, ''
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:1000] if e.fp else ''
+        status, message = parse_refresh_error(body)
+        if e.code == 401:
+            return None, status
+        return None, message or f'HTTP {e.code}'
+    except Exception as e:
+        return None, str(e)
+
+# ============== API 获取使用量 ==============
+
+import urllib.request
+import urllib.error
+
+def token_expired_or_expiring(access_token: str, last_refresh: str = '') -> bool:
+    """判断 access_token 是否需要刷新"""
+    if not access_token:
+        return True
+
+    payload = decode_jwt_payload(access_token) or {}
+    exp = payload.get('exp', 0)
+    now = time.time()
+    if exp and exp <= now + REFRESH_LOOKAHEAD_SECONDS:
+        return True
+
+    last_refresh_dt = parse_iso_datetime(last_refresh)
+    if last_refresh_dt and last_refresh_dt < datetime.now(timezone.utc) - timedelta(days=TOKEN_REFRESH_INTERVAL_DAYS):
+        return True
+
+    return False
+
+def request_usage_payload(access_token: str, account_id: str) -> Tuple[Optional[dict], Optional[int], str]:
+    """请求 usage API 原始响应"""
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'ChatGPT-Account-Id': account_id,
+        'User-Agent': 'codex-auth',
+        'Accept': 'application/json',
+        'Accept-Encoding': 'identity',
+    }
+
+    req = urllib.request.Request(USAGE_API_URL, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode()), resp.getcode(), ''
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode()[:1000] if e.fp else ''
+        return None, e.code, error_body
+    except Exception as e:
+        return None, None, str(e)
+
+def build_usage_data(data: dict) -> Optional[dict]:
+    """解析 usage API 响应"""
+    rate_limit = data.get('rate_limit', {})
+    primary = rate_limit.get('primary_window', {})
+    secondary = rate_limit.get('secondary_window', {})
+    plan_type = str(data.get('plan_type', 'unknown') or 'unknown')
+
+    if not primary and not secondary:
+        return None
+
+    is_team_family = plan_type in {'team', 'business', 'enterprise', 'edu'}
+    hourly_max = 80 if is_team_family else 50
+    weekly_max = 500 if is_team_family else 100
+
+    usage_data = {
+        'hourly_used': 'N/A',
+        'hourly_limit': str(hourly_max),
+        'hourly_remaining': 'N/A',
+        'hourly_percent': 0,
+        'weekly_used': 'N/A',
+        'weekly_limit': str(weekly_max),
+        'weekly_remaining': 'N/A',
+        'weekly_percent': 0,
+        'next_reset': 'N/A',
+        'next_reset_weekly': 'N/A',
+        'reset_at_hourly': 0,
+        'reset_at_weekly': 0,
+        'plan_type': plan_type,
+    }
+
+    # 5小时限额
+    if primary:
+        used_percent = primary.get('used_percent', 0)
+        used = int(hourly_max * used_percent / 100)
+        remaining = hourly_max - used
+        reset_at = int(primary.get('reset_at', 0) or 0)
+
+        usage_data['hourly_used'] = str(used)
+        usage_data['hourly_remaining'] = str(remaining)
+        usage_data['hourly_percent'] = used_percent
+        usage_data['reset_at_hourly'] = reset_at
+        usage_data['next_reset'] = format_reset_time(reset_at)
+
+    # 每周限额
+    if secondary:
+        used_percent = secondary.get('used_percent', 0)
+        used = int(weekly_max * used_percent / 100)
+        remaining = weekly_max - used
+        reset_at = int(secondary.get('reset_at', 0) or 0)
+
+        usage_data['weekly_used'] = str(used)
+        usage_data['weekly_remaining'] = str(remaining)
+        usage_data['weekly_percent'] = used_percent
+        usage_data['reset_at_weekly'] = reset_at
+        usage_data['next_reset_weekly'] = format_reset_time(reset_at)
+
+    return usage_data
+
+def attempt_token_refresh(auth_path: Path, auth_data: dict) -> Tuple[Optional[dict], str]:
+    """尝试刷新单个 auth 快照的 token"""
+    tokens = auth_data.get('tokens', {})
+    refresh_token = tokens.get('refresh_token', '')
+    if not refresh_token:
+        return None, 'missing_refresh_token'
+
+    refreshed_tokens, status = refresh_tokens_via_oauth(refresh_token)
+    if not refreshed_tokens:
+        return None, status or 'refresh_failed'
+
+    updated_auth = merge_refreshed_tokens(auth_data, refreshed_tokens)
+    if not save_auth_data_to_path(auth_path, updated_auth):
+        return None, 'save_failed'
+    return updated_auth, 'refreshed'
+
+def refresh_usage_for_auth_path(auth_path: Path) -> Optional[dict]:
+    """为指定 auth 文件刷新 usage，并在必要时刷新 token"""
+    auth_data = load_auth_data_from_path(auth_path)
+    if not auth_data:
+        return None
+
+    info = get_account_info(auth_data, str(auth_path))
+    if not info:
+        return None
+
+    if token_expired_or_expiring(info.get('access_token', ''), info.get('last_refresh', '')):
+        updated_auth, refresh_status = attempt_token_refresh(auth_path, auth_data)
+        if updated_auth:
+            auth_data = updated_auth
+            info = get_account_info(auth_data, str(auth_path))
+        elif refresh_status == 'reauth':
+            info['refresh_status'] = 'reauth'
+            info['refresh_status_text'] = '需重登'
+            return info
+
+    access_token = info.get('access_token', '')
+    account_id = info.get('account_id', '')
+    payload, status_code, _ = request_usage_payload(access_token, account_id)
+    if payload:
+        usage_data = build_usage_data(payload)
+        if usage_data:
+            save_usage_cache(
+                info.get('email', ''),
+                usage_data,
+                info.get('account_id', ''),
+                info.get('record_key', ''),
+            )
+            info = get_account_info(load_auth_data_from_path(auth_path) or auth_data, str(auth_path))
+            info['refresh_status'] = 'fresh'
+            info['refresh_status_text'] = '已刷新'
+            return info
+
+    if status_code in (401, 403):
+        updated_auth, refresh_status = attempt_token_refresh(auth_path, auth_data)
+        if updated_auth:
+            auth_data = updated_auth
+            info = get_account_info(auth_data, str(auth_path))
+            payload, _, _ = request_usage_payload(info.get('access_token', ''), info.get('account_id', ''))
+            if payload:
+                usage_data = build_usage_data(payload)
+                if usage_data:
+                    save_usage_cache(
+                        info.get('email', ''),
+                        usage_data,
+                        info.get('account_id', ''),
+                        info.get('record_key', ''),
+                    )
+                    info = get_account_info(auth_data, str(auth_path))
+                    info['refresh_status'] = 'fresh'
+                    info['refresh_status_text'] = '已刷新'
+                    return info
+        if refresh_status == 'reauth':
+            info['refresh_status'] = 'reauth'
+            info['refresh_status_text'] = '需重登'
+        else:
+            info['refresh_status'] = 'cached'
+            info['refresh_status_text'] = '缓存'
+        return info
+
+    cached_info = get_account_info(auth_data, str(auth_path)) or info
+    cached_info['refresh_status'] = 'cached'
+    cached_info['refresh_status_text'] = '缓存'
+    return cached_info
+
+def fetch_usage_via_api(email: str, access_token: str, account_id: str) -> Optional[dict]:
+    """通过 ChatGPT 后端 API 获取使用量信息"""
+    print(f"{Colors.CYAN}正在获取使用量...{Colors.ENDC}")
+    print(f"{Colors.DIM}账号: {email}{Colors.ENDC}")
+
+    payload, status_code, error = request_usage_payload(access_token, account_id)
+    if payload:
+        usage_data = build_usage_data(payload)
+        if usage_data:
+            save_usage_cache(email, usage_data, account_id)
+            print(f"{Colors.GREEN}  ✓ 获取成功！{Colors.ENDC}")
+            return usage_data
+
+    if status_code:
+        print(f"{Colors.RED}  ✗ API 请求失败: HTTP {status_code}{Colors.ENDC}")
+        if status_code == 401:
+            print(f"{Colors.YELLOW}  Token 已过期，请重新登录{Colors.ENDC}")
+        elif status_code == 403:
+            print(f"{Colors.YELLOW}  无权限访问，请检查账号状态{Colors.ENDC}")
+    elif error:
+        print(f"{Colors.RED}  ✗ 获取失败: {error}{Colors.ENDC}")
+    return None
+
+# ============== 账号管理 ==============
+
+def get_account_info(auth_data: dict, file_path: str = '') -> Optional[dict]:
+    """从 auth.json 数据中提取账号信息"""
+    tokens = auth_data.get('tokens', {})
+    id_token = tokens.get('id_token', '')
+    access_token = tokens.get('access_token', '')
+    refresh_token = tokens.get('refresh_token', '')
+
+    if not id_token:
+        return None
+
+    claims = extract_claims_from_id_token(id_token)
+    if not claims:
+        return None
+
+    payload = claims.get('payload', {})
+    auth_info = claims.get('auth_info', {})
+    email = claims.get('email', 'Unknown')
+    account_id = tokens.get('account_id', '') or claims.get('chatgpt_account_id', '')
+    chatgpt_user_id = claims.get('chatgpt_user_id', '')
+    record_key = claims.get('record_key', '')
+    organizations = normalize_organizations(auth_info)
+    primary_workspace = get_primary_workspace(organizations)
+    token_payload = decode_jwt_payload(access_token) or {}
+    token_exp = token_payload.get('exp', 0) or payload.get('exp', 0)
+
+    info = {
+        'email': email,
+        'name': payload.get('name', 'Unknown'),
+        'plan_type': auth_info.get('chatgpt_plan_type', 'Unknown'),
+        'account_id': account_id,
+        'chatgpt_user_id': chatgpt_user_id,
+        'record_key': record_key or (f"{email}::{account_id}" if email and account_id else file_path),
+        'organizations': organizations,
+        'workspace_title': primary_workspace.get('title', ''),
+        'workspace_id': primary_workspace.get('id', ''),
+        'workspace_role': primary_workspace.get('role', ''),
+        'workspace_is_default': bool(primary_workspace.get('is_default')),
+        'workspace_display': format_workspace_display(organizations, primary_workspace),
+        'sub_active_start': auth_info.get('chatgpt_subscription_active_start', ''),
+        'sub_active_until': auth_info.get('chatgpt_subscription_active_until', ''),
+        'last_refresh': auth_data.get('last_refresh', ''),
+        'token_exp': token_exp,
+        'access_token': access_token,
+        'refresh_token': refresh_token,
+        'file_path': file_path,
+        'refresh_status': 'unknown',
+        'refresh_status_text': '未刷新',
+    }
+
+    # 尝试加载使用量缓存
+    usage_cache = load_usage_cache(email, account_id, info['record_key'])
+    if usage_cache:
+        info.update({
+            'hourly_limit': usage_cache.get('hourly_limit', '?'),
+            'hourly_used': usage_cache.get('hourly_used', '?'),
+            'hourly_remaining': usage_cache.get('hourly_remaining', '?'),
+            'hourly_percent': usage_cache.get('hourly_percent', 0),
+            'weekly_limit': usage_cache.get('weekly_limit', '?'),
+            'weekly_used': usage_cache.get('weekly_used', '?'),
+            'weekly_remaining': usage_cache.get('weekly_remaining', '?'),
+            'weekly_percent': usage_cache.get('weekly_percent', 0),
+            'next_reset': usage_cache.get('next_reset', '?'),
+            'next_reset_weekly': usage_cache.get('next_reset_weekly', '?'),
+            'reset_at_hourly': usage_cache.get('reset_at_hourly', 0),
+            'reset_at_weekly': usage_cache.get('reset_at_weekly', 0),
+        })
+    else:
+        info.update({
+            'hourly_limit': '?',
+            'hourly_used': '?',
+            'hourly_remaining': '?',
+            'hourly_percent': 0,
+            'weekly_limit': '?',
+            'weekly_used': '?',
+            'weekly_remaining': '?',
+            'weekly_percent': 0,
+            'next_reset': '?',
+            'next_reset_weekly': '?',
+            'reset_at_hourly': 0,
+            'reset_at_weekly': 0,
+        })
+
+    return info
+
+def load_current_auth() -> Optional[dict]:
+    """加载当前 auth.json"""
+    return load_auth_data_from_path(get_auth_file())
+
+def save_auth_file_snapshot(
+    source_path: Path,
+    name: str,
+    replace_path: Optional[Path] = None,
+    allow_timestamp_suffix: bool = True,
+) -> Optional[Path]:
+    """将指定 auth 文件存档到账号目录"""
+    if not source_path.exists():
+        return None
+
+    accounts_dir = get_accounts_dir()
+    accounts_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = "".join(c if c.isalnum() or c in '-_' else '_' for c in name)
+
+    target_file = Path(replace_path) if replace_path else accounts_dir / f"auth_{safe_name}.json"
+    if not replace_path and allow_timestamp_suffix and target_file.exists():
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        target_file = accounts_dir / f"auth_{safe_name}_{timestamp}.json"
+
+    try:
+        shutil.copy2(source_path, target_file)
+        return target_file
+    except Exception:
+        return None
+
+def save_current_auth(name: str) -> bool:
+    """存档当前登录账号"""
+    return save_auth_file_snapshot(get_auth_file(), name) is not None
+
+def read_auth_file_bytes(auth_path: Path) -> Optional[bytes]:
+    """读取 auth 文件原始字节，用于失败回滚"""
+    if not auth_path.exists():
+        return None
+    try:
+        return auth_path.read_bytes()
+    except Exception:
+        return None
+
+def restore_auth_file(auth_path: Path, backup_bytes: Optional[bytes]) -> bool:
+    """恢复 auth 文件到备份内容"""
+    try:
+        if backup_bytes is None:
+            if auth_path.exists():
+                auth_path.unlink()
+            return True
+
+        auth_path.parent.mkdir(parents=True, exist_ok=True)
+        auth_path.write_bytes(backup_bytes)
+        return True
+    except Exception:
+        return False
+
+def find_saved_account_path(record_key: str = '', email: str = '') -> Optional[Path]:
+    """按账号身份或邮箱查找已存档文件"""
+    accounts_dir = get_accounts_dir()
+    if not accounts_dir.exists():
+        return None
+
+    email_lower = email.lower() if email else ''
+    fallback_path = None
+    for auth_file in sorted(accounts_dir.glob('auth_*.json')):
+        auth_data = load_auth_data_from_path(auth_file)
+        if not auth_data:
+            continue
+        info = get_account_info(auth_data, str(auth_file))
+        if not info:
+            continue
+        if record_key and info.get('record_key') == record_key:
+            return auth_file
+        if email_lower and info.get('email', '').lower() == email_lower and fallback_path is None:
+            fallback_path = auth_file
+
+    return fallback_path
+
+def upsert_current_auth_archive(account_info: dict) -> Tuple[bool, Optional[Path], str]:
+    """按账号身份更新或创建当前 auth 存档"""
+    record_key = account_info.get('record_key', '')
+    email = account_info.get('email', '')
+    existing_path = find_saved_account_path(record_key, email)
+    archive_path = save_auth_file_snapshot(
+        get_auth_file(),
+        email or 'account',
+        replace_path=existing_path,
+        allow_timestamp_suffix=existing_path is None,
+    )
+    if not archive_path:
+        return False, None, 'failed'
+    return True, archive_path, 'updated' if existing_path else 'created'
+
+def run_codex_login(auth_mode_args: Optional[List[str]] = None) -> dict:
+    """委托官方 codex login 完成登录"""
+    codex_binary = shutil.which('codex')
+    if not codex_binary:
+        return {
+            'ok': False,
+            'error': '未找到 codex 命令，请先安装或确认 PATH 配置',
+        }
+
+    auth_path = get_auth_file()
+    backup_bytes = read_auth_file_bytes(auth_path)
+    before_auth = load_auth_data_from_path(auth_path)
+    before_info = get_account_info(before_auth, str(auth_path)) if before_auth else None
+    ensure_current_account_saved()
+
+    command = [codex_binary, '-c', LOGIN_FILE_CREDENTIALS_CONFIG, 'login']
+    if auth_mode_args:
+        command.extend(auth_mode_args)
+    result = subprocess.run(command, check=False)
+
+    after_auth = load_auth_data_from_path(auth_path)
+    after_info = get_account_info(after_auth, str(auth_path)) if after_auth else None
+    if not after_info:
+        restored = restore_auth_file(auth_path, backup_bytes)
+        return {
+            'ok': False,
+            'error': '未获取到有效登录信息，已恢复原账号',
+            'restored': restored,
+            'returncode': result.returncode,
+        }
+
+    saved, archive_path, archive_action = upsert_current_auth_archive(after_info)
+    same_account = (
+        before_info is not None and
+        before_info.get('record_key') and
+        before_info.get('record_key') == after_info.get('record_key')
+    )
+    payload = {
+        'ok': True,
+        'account': after_info,
+        'archive_path': str(archive_path) if archive_path else '',
+        'archive_action': archive_action,
+        'same_account': same_account,
+        'returncode': result.returncode,
+    }
+    if not saved:
+        payload['archive_action'] = 'failed'
+        payload['warning'] = '登录成功，但账号存档失败'
+
+    return payload
+
+def list_saved_accounts() -> List[dict]:
+    """列出所有已存档的账号"""
+    accounts_dir = get_accounts_dir()
+    if not accounts_dir.exists():
+        return []
+
+    accounts = []
+    for auth_file in sorted(accounts_dir.glob('auth_*.json')):
+        try:
+            auth_data = load_auth_data_from_path(auth_file)
+            if not auth_data:
+                continue
+            info = get_account_info(auth_data, str(auth_file))
+            if info:
+                name = auth_file.stem.replace('auth_', '')
+                info['saved_name'] = name
+                info['file_path'] = str(auth_file)
+                accounts.append(info)
+        except Exception:
+            continue
+
+    return accounts
+
+def switch_to_account(account_file: str) -> bool:
+    """切换到指定账号"""
+    auth_file = get_auth_file()
+
+    if auth_file.exists():
+        backup_dir = get_switcher_dir() / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_file = backup_dir / f"auth_backup_{timestamp}.json"
+        try:
+            shutil.copy2(auth_file, backup_file)
+        except Exception:
+            pass
+
+    try:
+        shutil.copy2(account_file, auth_file)
+        return True
+    except Exception:
+        return False
+
+# ============== 界面 ==============
+
+def print_header():
+    """打印标题"""
+    width = 60
+    print()
+    print(f"{Colors.BOLD}{'═' * width}{Colors.ENDC}")
+    print(f"{Colors.BOLD}  Codex Switcher - 账号管理工具{Colors.ENDC}")
+    print(f"{Colors.BOLD}{'═' * width}{Colors.ENDC}")
+
+def print_menu():
+    """打印主菜单"""
+    print()
+    print(f"{Colors.CYAN}(1) 查看所有账号余量{Colors.ENDC}")
+    print(f"{Colors.CYAN}(2) 切换账号{Colors.ENDC}")
+    print(f"{Colors.CYAN}(3) 存档当前登录账号{Colors.ENDC}")
+    print(f"{Colors.CYAN}(0) 退出{Colors.ENDC}")
+    print()
+    print(f"{Colors.DIM}{'─' * 60}{Colors.ENDC}")
+
+def print_account_usage(acc: dict, show_detail: bool = True):
+    """打印账号使用量详情"""
+    email = acc.get('email', 'Unknown')
+    name = acc.get('name', 'Unknown')
+    plan = acc.get('plan_type', 'Unknown').upper()
+
+    # 计划颜色
+    if 'TEAM' in plan:
+        plan_color = Colors.CYAN
+    elif 'PLUS' in plan:
+        plan_color = Colors.BLUE
+    else:
+        plan_color = Colors.DIM
+
+    print(f"  邮箱:   {email}")
+    print(f"  用户:   {name}")
+    print(f"  计划:   {plan_color}{plan}{Colors.ENDC}")
+
+    # 使用量信息 - 计算剩余百分比
+    hourly_percent = acc.get('hourly_percent', 0)
+    weekly_percent = acc.get('weekly_percent', 0)
+    hourly_remaining_pct = 100 - hourly_percent if isinstance(hourly_percent, (int, float)) else 0
+    weekly_remaining_pct = 100 - weekly_percent if isinstance(weekly_percent, (int, float)) else 0
+
+    next_reset_hourly = acc.get('next_reset', '?')
+    next_reset_weekly = acc.get('next_reset_weekly', '?')
+
+    # 根据剩余百分比选择颜色
+    def get_remaining_color(pct):
+        if pct >= 50:
+            return Colors.GREEN
+        elif pct >= 20:
+            return Colors.YELLOW
+        else:
+            return Colors.RED
+
+    hourly_color = get_remaining_color(hourly_remaining_pct)
+    weekly_color = get_remaining_color(weekly_remaining_pct)
+
+    print(f"\n  {Colors.DIM}使用量:{Colors.ENDC}")
+    print(f"  ├─ 5小时限额:  {hourly_color}剩余 {hourly_remaining_pct}%{Colors.ENDC}  (重置: {next_reset_hourly})")
+    print(f"  └─ 每周限额:   {weekly_color}剩余 {weekly_remaining_pct}%{Colors.ENDC}  (重置: {next_reset_weekly})")
+
+    # Token 状态
+    exp = acc.get('token_exp', 0)
+    status, status_color = get_token_status(exp)
+    refresh_status = acc.get('refresh_status', 'unknown')
+    refresh_text = acc.get('refresh_status_text', '未刷新')
+    if refresh_status == 'fresh':
+        refresh_color = Colors.GREEN
+    elif refresh_status == 'reauth':
+        refresh_color = Colors.RED
+    else:
+        refresh_color = Colors.YELLOW
+
+    print(f"\n  Token:  {status_color}{status.upper()}{Colors.ENDC}")
+    print(f"  刷新:   {refresh_color}{refresh_text}{Colors.ENDC}")
+
+def print_current_account():
+    """打印当前账号信息"""
+    auth_data = load_current_auth()
+    if not auth_data:
+        print(f"{Colors.YELLOW}当前未登录任何账号{Colors.ENDC}")
+        return None
+
+    info = get_account_info(auth_data, str(get_auth_file()))
+    if not info:
+        print(f"{Colors.RED}无法解析当前账号信息{Colors.ENDC}")
+        return None
+
+    print()
+    print(f"{Colors.BOLD}  当前登录账号{Colors.ENDC}")
+    print(f"{Colors.DIM}  {'─' * 40}{Colors.ENDC}")
+    print_account_usage(info)
+    print()
+
+    return info
+
+def print_accounts_table(
+    accounts: List[dict],
+    title: str = "账号列表",
+    highlight_current_first: bool = False,
+):
+    """打印账号表格（包含使用量）"""
+    if not accounts:
+        print(f"{Colors.YELLOW}没有找到任何账号{Colors.ENDC}")
+        return
+
+    email_width = 32
+    plan_width = 6
+    status_width = 14
+    hourly_width = 20
+    weekly_width = 20
+    space_width = 14
+    table_width = 2 + 2 + email_width + 1 + space_width + 1 + plan_width + 1 + status_width + 1 + hourly_width + 1 + weekly_width + 2
+
+    print()
+    print(f"{Colors.BOLD}  {title}{Colors.ENDC}")
+    print(f"{Colors.DIM}  {'─' * table_width}{Colors.ENDC}")
+
+    # 表头
+    header = (
+        f"  {pad_display('#', 2)} "
+        f"{pad_display('邮箱', email_width)} "
+        f"{pad_display('SPACE', space_width)} "
+        f"{pad_display('PLAN', plan_width)} "
+        f"{pad_display('状态', status_width)} "
+        f"{pad_display('5小时', hourly_width)} "
+        f"{pad_display('每周', weekly_width)}"
+    )
+    print(f"{Colors.BOLD}{header}{Colors.ENDC}")
+    print(f"{Colors.DIM}  {'─' * table_width}{Colors.ENDC}")
+
+    current_rows = [acc for acc in accounts if acc.get('is_current')]
+    other_rows = [acc for acc in accounts if not acc.get('is_current')]
+
+    def render_row(i: int, acc: dict):
+        email = acc.get('email', 'Unknown')
+        if acc.get('is_current'):
+            email = f"[当前] {email}"
+        email = truncate_display_text(email, email_width)
+        email_cell = pad_display(email, email_width)
+
+        plan = str(acc.get('plan_type', 'Unknown') or 'Unknown').upper()
+        plan = truncate_display_text(plan, plan_width)
+        plan_cell = pad_display(plan, plan_width)
+        if 'TEAM' in plan:
+            plan_display = f"{Colors.CYAN}{plan_cell}{Colors.ENDC}"
+        elif 'PLUS' in plan:
+            plan_display = f"{Colors.BLUE}{plan_cell}{Colors.ENDC}"
+        else:
+            plan_display = f"{Colors.DIM}{plan_cell}{Colors.ENDC}"
+
+        # 使用量与账号状态
+        hourly_remaining = get_remaining_percent(acc, 'hourly')
+        weekly_remaining = get_remaining_percent(acc, 'weekly')
+        status_code, status_text = get_account_status(acc)
+
+        # 根据剩余百分比选择颜色
+        def get_color(pct):
+            if pct < 0:
+                return Colors.DIM
+            if pct >= 50:
+                return Colors.GREEN
+            elif pct >= 20:
+                return Colors.YELLOW
+            else:
+                return Colors.RED
+
+        def get_status_color(code):
+            if code == 'ok':
+                return Colors.GREEN
+            if code == 'exhausted':
+                return Colors.YELLOW
+            if code == 'reauth':
+                return Colors.RED
+            return Colors.DIM
+
+        hourly_reset = format_reset_time_compact(acc.get('reset_at_hourly', 0))
+        weekly_reset = format_reset_time_compact(acc.get('reset_at_weekly', 0))
+        if hourly_remaining < 0:
+            hourly_str = f"未知({hourly_reset})"
+        else:
+            hourly_str = f"剩余{hourly_remaining}%({hourly_reset})"
+        if weekly_remaining < 0:
+            weekly_str = f"未知({weekly_reset})"
+        else:
+            weekly_str = f"剩余{weekly_remaining}%({weekly_reset})"
+        space_text = acc.get('workspace_title', '') or acc.get('workspace_display', '') or '-'
+        space_text = truncate_display_text(space_text, space_width)
+        space_display = pad_display(space_text, space_width)
+        status_cell = pad_display(truncate_display_text(status_text, status_width), status_width)
+        status_display = f"{get_status_color(status_code)}{status_cell}{Colors.ENDC}"
+
+        # 带颜色的使用量显示
+        hourly_display = f"{get_color(hourly_remaining)}{pad_display(hourly_str, hourly_width)}{Colors.ENDC}"
+        weekly_display = f"{get_color(weekly_remaining)}{pad_display(weekly_str, weekly_width)}{Colors.ENDC}"
+
+        index_cell = pad_display(str(i), 2)
+        print(f"  {index_cell} {email_cell} {space_display} {plan_display} {status_display} {hourly_display} {weekly_display}")
+
+    if highlight_current_first and current_rows:
+        for i, acc in enumerate(current_rows, 1):
+            render_row(i, acc)
+        if other_rows:
+            print()
+        start_index = len(current_rows) + 1
+        for offset, acc in enumerate(other_rows, start_index):
+            render_row(offset, acc)
+    else:
+        for i, acc in enumerate(accounts, 1):
+            render_row(i, acc)
+
+    print()
+
+def format_reset_time(reset_at_ts: int) -> str:
+    """将 Unix 时间戳格式化为可读的重置时间"""
+    if not reset_at_ts:
+        return 'N/A'
+    try:
+        # 转换为本地时间
+        dt = datetime.fromtimestamp(reset_at_ts)
+        now = datetime.now()
+
+        # 计算时间差
+        delta = dt - now
+        total_seconds = int(delta.total_seconds())
+
+        if total_seconds <= 0:
+            return "即将重置"
+
+        # 格式化具体时间点
+        time_str = dt.strftime('%H:%M')
+
+        # 判断是今天还是其他日期
+        if dt.date() == now.date():
+            date_str = "今天"
+        elif dt.date() == (now + timedelta(days=1)).date():
+            date_str = "明天"
+        else:
+            date_str = dt.strftime('%m/%d')
+
+        # 计算剩余时间
+        if total_seconds >= 86400:  # 超过1天
+            days = total_seconds // 86400
+            hours = (total_seconds % 86400) // 3600
+            remaining = f"{days}d{hours}h"
+        elif total_seconds >= 3600:  # 超过1小时
+            hours = total_seconds // 3600
+            minutes = (total_seconds % 3600) // 60
+            remaining = f"{hours}h{minutes}m"
+        else:
+            minutes = total_seconds // 60
+            remaining = f"{minutes}m"
+
+        return f"{date_str} {time_str} ({remaining})"
+    except:
+        return 'N/A'
+
+def format_reset_time_compact(reset_at_ts: int) -> str:
+    """将 Unix 时间戳格式化为列表紧凑展示"""
+    if not reset_at_ts:
+        return '?'
+    try:
+        dt = datetime.fromtimestamp(reset_at_ts)
+        now = datetime.now()
+        if dt <= now:
+            return '即将'
+
+        if dt.date() == now.date():
+            return dt.strftime('%H:%M')
+        if dt.date() == (now + timedelta(days=1)).date():
+            return f"明{dt.strftime('%H:%M')}"
+        return dt.strftime('%m/%d %H:%M')
+    except Exception:
+        return '?'
+
+def refresh_account_usage(email: str, access_token: str, account_id: str) -> Optional[dict]:
+    """刷新单个账号的使用量（静默版本）"""
+    payload, _, _ = request_usage_payload(access_token, account_id)
+    if not payload:
+        return None
+    usage_data = build_usage_data(payload)
+    if not usage_data:
+        return None
+    save_usage_cache(email, usage_data, account_id)
+    return usage_data
+
+def collect_account_entries() -> List[dict]:
+    """收集当前账号和已存档账号的显示条目"""
+    entries = []
+
+    current_path = get_auth_file()
+    current_auth = load_auth_data_from_path(current_path)
+    if current_auth:
+        current_info = get_account_info(current_auth, str(current_path))
+        if current_info:
+            entries.append({
+                'kind': 'current',
+                'path': current_path,
+                'identity': current_info.get('record_key') or str(current_path),
+                'info': current_info,
+            })
+
+    accounts_dir = get_accounts_dir()
+    if not accounts_dir.exists():
+        return entries
+
+    for auth_file in sorted(accounts_dir.glob('auth_*.json')):
+        auth_data = load_auth_data_from_path(auth_file)
+        if not auth_data:
+            continue
+        info = get_account_info(auth_data, str(auth_file))
+        if not info:
+            continue
+        entries.append({
+            'kind': 'saved',
+            'path': auth_file,
+            'saved_name': auth_file.stem.replace('auth_', ''),
+            'identity': info.get('record_key') or str(auth_file),
+            'info': info,
+        })
+
+    return entries
+
+def is_current_account_saved(current_record_key: str) -> bool:
+    """检查当前账号是否已经存在于存档中"""
+    if not current_record_key:
+        return False
+
+    accounts_dir = get_accounts_dir()
+    if not accounts_dir.exists():
+        return False
+
+    for auth_file in sorted(accounts_dir.glob('auth_*.json')):
+        auth_data = load_auth_data_from_path(auth_file)
+        if not auth_data:
+            continue
+        info = get_account_info(auth_data, str(auth_file))
+        if info and info.get('record_key') == current_record_key:
+            return True
+    return False
+
+def ensure_current_account_saved() -> bool:
+    """自动存档当前未存档账号"""
+    auth_data = load_current_auth()
+    if not auth_data:
+        return False
+
+    info = get_account_info(auth_data, str(get_auth_file()))
+    if not info:
+        return False
+
+    record_key = info.get('record_key', '')
+    if is_current_account_saved(record_key):
+        return True
+
+    save_name = info.get('email', 'account')
+    return save_current_auth(save_name)
+
+def clone_display_info(info: dict, entry: dict) -> dict:
+    """克隆用于展示的账号信息"""
+    display = dict(info)
+    display['file_path'] = str(entry['path'])
+    if entry.get('saved_name'):
+        display['saved_name'] = entry['saved_name']
+    return display
+
+def print_refresh_progress(current: int, total: int, width: int = 24):
+    """打印刷新进度条"""
+    if total <= 0:
+        return
+    filled = int(width * current / total)
+    bar = f"{Colors.GREEN}{'#' * filled}{Colors.DIM}{'-' * (width - filled)}{Colors.ENDC}"
+    sys.stdout.write(f"\r  刷新进度: [{bar}] {current}/{total}")
+    sys.stdout.flush()
+    if current >= total:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+def refresh_view_job(job: Dict[str, Any]) -> dict:
+    """执行单个账号的实时刷新任务"""
+    primary_path = Path(job['primary_path'])
+    seed_info = dict(job['seed_info'])
+
+    refreshed_info = refresh_usage_for_auth_path(primary_path)
+    if not refreshed_info:
+        refreshed_info = seed_info
+        refreshed_info['refresh_status'] = 'cached'
+        refreshed_info['refresh_status_text'] = '缓存'
+
+    refreshed_auth = load_auth_data_from_path(primary_path)
+    if refreshed_auth and len(job['paths']) > 1:
+        for extra_path in job['paths']:
+            extra_path = Path(extra_path)
+            if extra_path == primary_path:
+                continue
+            mirror_auth_tokens_to_path(extra_path, refreshed_auth)
+
+    return refreshed_info
+
+def build_refresh_jobs(entries: List[dict]) -> Dict[str, Dict[str, Any]]:
+    """根据账号条目构建去重后的刷新任务"""
+    refresh_jobs: Dict[str, Dict[str, Any]] = {}
+
+    for entry in entries:
+        identity = entry['identity']
+        job = refresh_jobs.get(identity)
+        if not job:
+            refresh_jobs[identity] = {
+                'primary_path': entry['path'],
+                'paths': [entry['path']],
+                'has_current': entry['kind'] == 'current',
+                'seed_info': entry['info'],
+            }
+            continue
+
+        job['paths'].append(entry['path'])
+        if entry['kind'] == 'current' and not job['has_current']:
+            job['primary_path'] = entry['path']
+            job['has_current'] = True
+
+    return refresh_jobs
+
+def refresh_jobs_live(
+    refresh_jobs: Dict[str, Dict[str, Any]],
+    show_progress: bool = False,
+) -> Dict[str, dict]:
+    """并发刷新所有账号的最新在线数据"""
+    results: Dict[str, dict] = {}
+    job_items = list(refresh_jobs.items())
+    if not job_items:
+        return results
+
+    if show_progress:
+        print()
+
+    max_workers = min(len(job_items), MAX_REFRESH_WORKERS)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(refresh_view_job, job): (identity, job)
+            for identity, job in job_items
+        }
+
+        for future in as_completed(future_map):
+            identity, job = future_map[future]
+            try:
+                results[identity] = future.result()
+            except Exception:
+                fallback = dict(job['seed_info'])
+                fallback['refresh_status'] = 'cached'
+                fallback['refresh_status_text'] = '缓存'
+                results[identity] = fallback
+
+            completed += 1
+            if show_progress:
+                print_refresh_progress(completed, len(job_items))
+
+    return results
+
+def build_view_all_rows(
+    refresh_jobs: Dict[str, Dict[str, Any]],
+    results: Dict[str, dict],
+) -> List[dict]:
+    """构建查看余量页面的统一账号行"""
+    rows = []
+    current_auth_path = str(get_auth_file())
+
+    for identity, job in refresh_jobs.items():
+        base_info = results.get(identity) or job['seed_info']
+        all_paths = [str(path) for path in job['paths']]
+        saved_paths = [path for path in all_paths if path != current_auth_path]
+
+        row = dict(base_info)
+        row['identity'] = identity
+        row['is_current'] = job['has_current']
+        row['is_saved'] = bool(saved_paths)
+        row['switch_path'] = saved_paths[0] if saved_paths else None
+        rows.append(row)
+
+    return rows
+
+def load_live_account_rows(show_progress: bool = False) -> List[dict]:
+    """加载并实时刷新账号列表"""
+    ensure_current_account_saved()
+    entries = collect_account_entries()
+    refresh_jobs = build_refresh_jobs(entries)
+    results = refresh_jobs_live(refresh_jobs, show_progress=show_progress)
+    return build_view_all_rows(refresh_jobs, results)
+
+def get_remaining_percent(acc: dict, window: str) -> int:
+    """获取指定窗口的剩余百分比"""
+    if not has_known_usage_data(acc):
+        return -1
+    key = 'hourly_percent' if window == 'hourly' else 'weekly_percent'
+    used_percent = acc.get(key, 0)
+    if not isinstance(used_percent, (int, float)):
+        return -1
+    return max(0, 100 - int(used_percent))
+
+def get_remaining_count(acc: dict, window: str) -> int:
+    """获取指定窗口的剩余数量"""
+    key = 'hourly_remaining' if window == 'hourly' else 'weekly_remaining'
+    value = acc.get(key, '')
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+def has_known_usage_data(acc: dict) -> bool:
+    """机器选择链路只接受能读出额度的账号"""
+    return (
+        get_remaining_count(acc, 'hourly') >= 0 and
+        get_remaining_count(acc, 'weekly') >= 0
+    )
+
+def has_available_usage_quota(acc: dict) -> bool:
+    """机器选择链路只接受仍有可用额度的账号"""
+    return (
+        get_remaining_count(acc, 'hourly') > 0 and
+        get_remaining_count(acc, 'weekly') > 0
+    )
+
+def needs_reauth(acc: dict) -> bool:
+    """判断账号是否已进入需要重新登录的状态"""
+    return str(acc.get('refresh_status', '') or '').lower() == 'reauth'
+
+def get_account_status(acc: dict) -> Tuple[str, str]:
+    """返回账号状态码和展示文案"""
+    if needs_reauth(acc):
+        return 'reauth', 'auth token失效'
+    if not has_known_usage_data(acc):
+        return 'unknown_usage', '额度未知'
+    if not has_available_usage_quota(acc):
+        return 'exhausted', '额度耗尽'
+    return 'ok', '正常'
+
+def is_machine_healthy_account(acc: dict) -> bool:
+    """判定账号是否可用于机器选择与自动切换"""
+    status, _ = get_account_status(acc)
+    return status == 'ok'
+
+def filter_machine_healthy_accounts(rows: List[dict]) -> List[dict]:
+    """过滤出健康账号，供 --list / --best 这类机器命令使用"""
+    return [row for row in rows if is_machine_healthy_account(row)]
+
+def get_account_ranking_tier(acc: dict) -> int:
+    """按周额度阈值将账号分层排序"""
+    status, _ = get_account_status(acc)
+    if status == 'ok':
+        weekly_remaining_pct = get_remaining_percent(acc, 'weekly')
+        if weekly_remaining_pct >= WEEKLY_REMAINING_WARNING_THRESHOLD:
+            return 0
+        return 1
+    return 2
+
+def get_account_sort_key(acc: dict) -> Tuple[int, int, int, str]:
+    """统一账号排序键：先分层，再按周额度、小时额度和邮箱排序"""
+    return (
+        get_account_ranking_tier(acc),
+        -get_remaining_percent(acc, 'weekly'),
+        -get_remaining_percent(acc, 'hourly'),
+        str(acc.get('email', '')),
+    )
+
+def sort_accounts_for_agent(rows: List[dict]) -> List[dict]:
+    """按周额度分层后排序账号"""
+    return sorted(rows, key=get_account_sort_key)
+
+def sort_accounts_for_live_view(rows: List[dict]) -> List[dict]:
+    """查看余量页排序：当前账号置顶，其他账号按剩余数量排序"""
+    current_rows = [row for row in rows if row.get('is_current')]
+    other_rows = [row for row in rows if not row.get('is_current')]
+    return current_rows + sort_accounts_for_agent(other_rows)
+
+def get_usage_cache_candidates(email: str, account_id: str = '', record_key: str = '') -> List[Path]:
+    """列出账号可能对应的 usage cache 文件"""
+    candidates = [get_usage_cache_file(email, account_id, record_key)]
+    legacy_cache = get_usage_cache_dir() / f"usage_{sanitize_key(email)}.json" if email else None
+    if legacy_cache and legacy_cache not in candidates:
+        candidates.append(legacy_cache)
+    return candidates
+
+def delete_saved_account_artifacts(row: dict) -> Tuple[bool, List[str]]:
+    """删除存档账号及其 usage cache"""
+    deleted_paths: List[str] = []
+    deleted_any = False
+
+    switch_path = row.get('switch_path')
+    if switch_path:
+        auth_path = Path(str(switch_path))
+        if auth_path.exists():
+            auth_path.unlink()
+            deleted_paths.append(str(auth_path))
+            deleted_any = True
+
+    for cache_path in get_usage_cache_candidates(
+        row.get('email', ''),
+        row.get('account_id', ''),
+        row.get('identity', ''),
+    ):
+        if cache_path.exists():
+            cache_path.unlink()
+            deleted_paths.append(str(cache_path))
+            deleted_any = True
+
+    return deleted_any, deleted_paths
+
+def serialize_account(acc: dict, rank: Optional[int] = None) -> dict:
+    """将账号信息序列化为 CLI/JSON 输出"""
+    status, status_text = get_account_status(acc)
+    data = {
+        'rank': rank,
+        'email': acc.get('email', ''),
+        'plan_type': str(acc.get('plan_type', '') or '').upper(),
+        'is_current': bool(acc.get('is_current')),
+        'is_saved': bool(acc.get('is_saved')),
+        'identity': acc.get('identity', ''),
+        'status': status,
+        'status_text': status_text,
+        'switch_path': acc.get('switch_path'),
+        'hourly_remaining_pct': get_remaining_percent(acc, 'hourly'),
+        'weekly_remaining_pct': get_remaining_percent(acc, 'weekly'),
+        'hourly_reset_at': acc.get('reset_at_hourly', 0),
+        'weekly_reset_at': acc.get('reset_at_weekly', 0),
+        'hourly_reset': format_reset_time_compact(acc.get('reset_at_hourly', 0)),
+        'weekly_reset': format_reset_time_compact(acc.get('reset_at_weekly', 0)),
+        'workspace_title': acc.get('workspace_title', ''),
+        'workspace_id': acc.get('workspace_id', ''),
+        'workspace_role': acc.get('workspace_role', ''),
+        'workspace_display': acc.get('workspace_display', ''),
+    }
+    return data
+
+def print_ranked_accounts(rows: List[dict], title: str = "可用账号"):
+    """输出按剩余量排序后的账号列表"""
+    if not rows:
+        print("没有可用账号")
+        return
+
+    print()
+    print(f"{Colors.BOLD}{title}{Colors.ENDC}")
+    print_accounts_table(rows, title="")
+    print(f"{Colors.DIM}共 {len(rows)} 个账号{Colors.ENDC}")
+
+def resolve_account_selector(rows: List[dict], selector: str) -> Optional[dict]:
+    """根据 index/email/identity/best 解析账号选择器"""
+    ranked = sort_accounts_for_agent(rows)
+    normalized = selector.strip()
+    if not normalized:
+        return None
+
+    if normalized.lower() == 'best':
+        return ranked[0] if ranked else None
+
+    if normalized.isdigit():
+        idx = int(normalized) - 1
+        if 0 <= idx < len(ranked):
+            return ranked[idx]
+        return None
+
+    lowered = normalized.lower()
+    for row in ranked:
+        if row.get('email', '').lower() == lowered:
+            return row
+        if row.get('identity', '') == normalized:
+            return row
+    return None
+
+def print_view_all_actions(rows: List[dict]):
+    """打印查看余量页面底部操作"""
+    print(f"{Colors.BOLD}  操作面板{Colors.ENDC}")
+    print(f"{Colors.DIM}  {'─' * 40}{Colors.ENDC}")
+    print(f"  {Colors.CYAN}[编号]{Colors.ENDC} 切换账号")
+    print(f"  {Colors.CYAN}[r]{Colors.ENDC} 刷新账号状态")
+    print(f"  {Colors.CYAN}[a]{Colors.ENDC} 添加账号（官方登录）")
+    print(f"  {Colors.CYAN}[d]{Colors.ENDC} 删除账号")
+    print(f"  {Colors.CYAN}[0]{Colors.ENDC} 退出工具")
+    print()
+
+def print_delete_actions():
+    """打印删除页面操作"""
+    print(f"{Colors.BOLD}  删除面板{Colors.ENDC}")
+    print(f"{Colors.DIM}  {'─' * 40}{Colors.ENDC}")
+    print(f"  {Colors.CYAN}[编号]{Colors.ENDC} 删除对应账号")
+    print(f"  {Colors.CYAN}[0]{Colors.ENDC} 返回上一页")
+    print()
+
+def delete_account_from_view():
+    """在独立页面中删除已存档账号"""
+    while True:
+        print_header()
+        print(f"\n{Colors.CYAN}>>> 删除账号{Colors.ENDC}")
+        rows = sort_accounts_for_live_view(load_live_account_rows(show_progress=True))
+        print_header()
+        print(f"\n{Colors.CYAN}>>> 删除账号{Colors.ENDC}")
+        if rows:
+            print_accounts_table(rows, "选择要删除的账号", highlight_current_first=True)
+            print(f"{Colors.DIM}  当前账号不会被删除，且不会修改 ~/.codex/auth.json{Colors.ENDC}")
+        else:
+            print(f"\n{Colors.YELLOW}  当前未登录任何账号，且没有已存档账号{Colors.ENDC}")
+
+        print()
+        print_delete_actions()
+
+        while True:
+            try:
+                choice = input("  请选择: ").strip()
+            except KeyboardInterrupt:
+                print(f"\n{Colors.YELLOW}  已取消{Colors.ENDC}")
+                return
+
+            if choice == '':
+                continue
+            if choice == '0':
+                return
+
+            try:
+                idx = int(choice) - 1
+            except ValueError:
+                print(f"\n{Colors.RED}  请输入编号或 0{Colors.ENDC}")
+                input(f"{Colors.DIM}按回车键继续...{Colors.ENDC}")
+                break
+
+            if idx < 0 or idx >= len(rows):
+                print(f"\n{Colors.RED}  无效的编号{Colors.ENDC}")
+                input(f"{Colors.DIM}按回车键继续...{Colors.ENDC}")
+                break
+
+            row = rows[idx]
+            if row.get('is_current'):
+                print(f"\n{Colors.YELLOW}  当前账号不能删除，请先切换到其他账号{Colors.ENDC}")
+                input(f"{Colors.DIM}按回车键继续...{Colors.ENDC}")
+                break
+
+            if not row.get('switch_path'):
+                print(f"\n{Colors.RED}  该账号没有可删除的存档文件{Colors.ENDC}")
+                input(f"{Colors.DIM}按回车键继续...{Colors.ENDC}")
+                break
+
+            confirm = input(f"\n  确认删除 {row.get('email', 'Unknown')} ? [y/N]: ").strip().lower()
+            if confirm not in {'y', 'yes'}:
+                break
+
+            deleted, deleted_paths = delete_saved_account_artifacts(row)
+            if deleted:
+                print(f"{Colors.GREEN}  ✓ 删除成功：{row.get('email', 'Unknown')}{Colors.ENDC}")
+                for deleted_path in deleted_paths:
+                    print(f"{Colors.DIM}  已删除: {deleted_path}{Colors.ENDC}")
+                time.sleep(0.5)
+                break
+
+            print(f"{Colors.RED}  ✗ 没有找到可删除的存档或缓存{Colors.ENDC}")
+            input(f"{Colors.DIM}按回车键继续...{Colors.ENDC}")
+            break
+
+def add_account_from_view() -> bool:
+    """在余量页中通过官方 codex login 添加账号"""
+    print_header()
+    print(f"\n{Colors.CYAN}>>> 添加账号{Colors.ENDC}")
+    print()
+    print(f"{Colors.DIM}  将调用官方 codex login 完成登录。{Colors.ENDC}")
+    print(f"{Colors.DIM}  登录成功后会自动读取当前账号、写入存档，并保持该账号为当前账号。{Colors.ENDC}")
+    print(f"{Colors.DIM}  如浏览器不可用，可在登录界面使用 device code，或稍后手动运行 codex login --device-auth。{Colors.ENDC}")
+    print()
+
+    result = run_codex_login()
+    print()
+    if not result.get('ok'):
+        print(f"{Colors.RED}  ✗ 添加账号失败：{result.get('error', '未知错误')}{Colors.ENDC}")
+        input(f"{Colors.DIM}按回车键继续...{Colors.ENDC}")
+        return False
+
+    account = result.get('account', {})
+    email = account.get('email', 'Unknown')
+    archive_action = result.get('archive_action', 'failed')
+    if result.get('same_account'):
+        print(f"{Colors.YELLOW}  当前仍为同一账号：{email}{Colors.ENDC}")
+    else:
+        print(f"{Colors.GREEN}  ✓ 添加并切换成功：{email}{Colors.ENDC}")
+
+    if archive_action == 'created':
+        print(f"{Colors.DIM}  已新增账号存档: {result.get('archive_path', '')}{Colors.ENDC}")
+    elif archive_action == 'updated':
+        print(f"{Colors.DIM}  已更新现有账号存档: {result.get('archive_path', '')}{Colors.ENDC}")
+    else:
+        print(f"{Colors.YELLOW}  {result.get('warning', '账号存档未更新')}{Colors.ENDC}")
+
+    if result.get('same_account'):
+        time.sleep(1.0)
+        return True
+
+    finish_switch_with_restart()
+    time.sleep(1.0)
+    return True
+
+def view_all_accounts():
+    """查看所有账号（自动刷新使用量）"""
+    while True:
+        print_header()
+        print(f"\n{Colors.CYAN}>>> 查看所有账号余量{Colors.ENDC}")
+        rows = sort_accounts_for_live_view(load_live_account_rows(show_progress=True))
+        print_header()
+        print(f"\n{Colors.CYAN}>>> 查看所有账号余量{Colors.ENDC}")
+        if rows:
+            print_accounts_table(rows, "账号列表", highlight_current_first=True)
+        else:
+            print(f"\n{Colors.YELLOW}  当前未登录任何账号，且没有已存档账号{Colors.ENDC}")
+
+        print(f"{Colors.DIM}  共 {len(rows)} 个账号{Colors.ENDC}")
+        print()
+        print_view_all_actions(rows)
+
+        while True:
+            try:
+                choice = input("  请选择: ").strip()
+            except KeyboardInterrupt:
+                print(f"\n{Colors.YELLOW}  已取消{Colors.ENDC}")
+                return
+
+            if choice == '':
+                continue
+            if choice == '0':
+                return
+            if choice.lower() == 'r':
+                break
+            if choice.lower() == 'a':
+                add_account_from_view()
+                break
+            if choice.lower() == 'd':
+                delete_account_from_view()
+                break
+
+            try:
+                idx = int(choice) - 1
+            except ValueError:
+                print(f"\n{Colors.RED}  请输入编号、r、a、d 或 0{Colors.ENDC}")
+                input(f"{Colors.DIM}按回车键继续...{Colors.ENDC}")
+                break
+
+            if idx < 0 or idx >= len(rows):
+                print(f"\n{Colors.RED}  无效的编号{Colors.ENDC}")
+                input(f"{Colors.DIM}按回车键继续...{Colors.ENDC}")
+                break
+
+            row = rows[idx]
+            if row.get('is_current'):
+                print(f"\n{Colors.YELLOW}  该账号已经是当前登录账号{Colors.ENDC}")
+                input(f"{Colors.DIM}按回车键继续...{Colors.ENDC}")
+                break
+
+            switch_path = row.get('switch_path')
+            if not switch_path:
+                print(f"\n{Colors.RED}  该账号尚未存档，无法切换{Colors.ENDC}")
+                input(f"{Colors.DIM}按回车键继续...{Colors.ENDC}")
+                break
+
+            print(f"\n{Colors.CYAN}  正在切换到: {row.get('email', 'Unknown')}{Colors.ENDC}")
+            if switch_to_account(switch_path):
+                print(f"{Colors.GREEN}  ✓ 切换成功！{Colors.ENDC}")
+                finish_switch_with_restart()
+                time.sleep(1.0)
+            else:
+                print(f"{Colors.RED}  ✗ 切换失败{Colors.ENDC}")
+                input(f"{Colors.DIM}按回车键继续...{Colors.ENDC}")
+            break
+
+def switch_account():
+    """切换账号"""
+    print_header()
+    print(f"\n{Colors.CYAN}>>> 切换账号{Colors.ENDC}")
+
+    print_current_account()
+
+    saved = list_saved_accounts()
+    if not saved:
+        print(f"{Colors.YELLOW}没有已存档的账号，请先使用功能(3)存档当前账号{Colors.ENDC}")
+        return
+
+    print_accounts_table(saved, "选择要切换的账号")
+
+    print(f"  {Colors.DIM}输入编号切换，输入 0 取消{Colors.ENDC}")
+    print()
+
+    try:
+        choice = input(f"  请选择: ").strip()
+        if choice == '0' or choice == '':
+            return
+
+        idx = int(choice) - 1
+        if 0 <= idx < len(saved):
+            account = saved[idx]
+            print()
+            print(f"{Colors.CYAN}  正在切换到: {account['email']}{Colors.ENDC}")
+
+            if switch_to_account(account['file_path']):
+                print(f"{Colors.GREEN}  ✓ 切换成功！{Colors.ENDC}")
+                finish_switch_with_restart()
+                time.sleep(1.0)
+                return
+            else:
+                print(f"{Colors.RED}  ✗ 切换失败{Colors.ENDC}")
+        else:
+            print(f"{Colors.RED}  无效的选择{Colors.ENDC}")
+    except ValueError:
+        print(f"{Colors.RED}  请输入有效的数字{Colors.ENDC}")
+    except KeyboardInterrupt:
+        print(f"\n{Colors.YELLOW}  已取消{Colors.ENDC}")
+
+def save_account():
+    """存档当前账号"""
+    print_header()
+    print(f"\n{Colors.CYAN}>>> 存档当前登录账号{Colors.ENDC}")
+
+    info = print_current_account()
+    if not info:
+        return
+
+    print(f"  {Colors.DIM}输入存档名称（直接回车使用完整邮箱）{Colors.ENDC}")
+    print()
+
+    try:
+        name = input(f"  存档名称: ").strip()
+        if not name:
+            name = info.get('email', 'account')
+
+        print()
+        print(f"{Colors.CYAN}  正在存档: {name}{Colors.ENDC}")
+
+        if save_current_auth(name):
+            print(f"{Colors.GREEN}  ✓ 存档成功！{Colors.ENDC}")
+            print(f"{Colors.DIM}  保存位置: {get_accounts_dir()}{Colors.ENDC}")
+        else:
+            print(f"{Colors.RED}  ✗ 存档失败{Colors.ENDC}")
+    except KeyboardInterrupt:
+        print(f"\n{Colors.YELLOW}  已取消{Colors.ENDC}")
+
+def refresh_usage():
+    """刷新使用量"""
+    print_header()
+    print(f"\n{Colors.CYAN}>>> 刷新使用量{Colors.ENDC}")
+
+    auth_path = get_auth_file()
+    auth_data = load_current_auth()
+    if not auth_data:
+        print(f"{Colors.YELLOW}当前未登录任何账号{Colors.ENDC}")
+        return
+
+    info = get_account_info(auth_data, str(auth_path))
+    if not info:
+        print(f"{Colors.RED}无法解析当前账号信息{Colors.ENDC}")
+        return
+
+    email = info.get('email', '')
+
+    print(f"\n  账号: {email}")
+    print()
+
+    refreshed_info = refresh_usage_for_auth_path(auth_path)
+    if refreshed_info:
+        info = refreshed_info
+
+    usage_cache = load_usage_cache(
+        info.get('email', ''),
+        info.get('account_id', ''),
+        info.get('record_key', ''),
+    )
+
+    if usage_cache:
+        plan_type = usage_cache.get('plan_type', info.get('plan_type', 'unknown'))
+        hourly_percent = usage_cache.get('hourly_percent', 0)
+        weekly_percent = usage_cache.get('weekly_percent', 0)
+        hourly_remaining = 100 - hourly_percent if hourly_percent else 0
+        weekly_remaining = 100 - weekly_percent if weekly_percent else 0
+
+        # 根据剩余百分比选择颜色
+        def get_remaining_color(pct):
+            if pct >= 50:
+                return Colors.GREEN
+            elif pct >= 20:
+                return Colors.YELLOW
+            else:
+                return Colors.RED
+
+        print()
+        print(f"  {Colors.BOLD}使用量信息:{Colors.ENDC}")
+        print(f"  {Colors.DIM}{'─' * 50}{Colors.ENDC}")
+        print(f"  计划类型:   {Colors.CYAN}{plan_type.upper()}{Colors.ENDC}")
+        print(f"  刷新状态:   {info.get('refresh_status_text', '未刷新')}")
+        print()
+        print(f"  5小时限额:  {get_remaining_color(hourly_remaining)}剩余 {hourly_remaining}%{Colors.ENDC}  (重置: {usage_cache.get('next_reset', 'N/A')})")
+        print(f"  每周限额:   {get_remaining_color(weekly_remaining)}剩余 {weekly_remaining}%{Colors.ENDC}  (重置: {usage_cache.get('next_reset_weekly', 'N/A')})")
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """构建非交互 CLI 参数解析器"""
+    parser = argparse.ArgumentParser(
+        prog='codex-switcher',
+        description='Codex 账号切换与余量查看工具',
+    )
+    parser.add_argument('--list', action='store_true', help='实时列出账号并按剩余量排序')
+    parser.add_argument('--json', action='store_true', help='以 JSON 输出结果')
+    parser.add_argument('--best', action='store_true', help='输出当前最佳账号')
+    parser.add_argument('--switch', metavar='SELECTOR', help='按序号、邮箱或 best 切换账号')
+    parser.add_argument('--delete', metavar='SELECTOR', help='按序号、邮箱或 identity 删除已存档账号')
+    parser.add_argument(
+        '--export',
+        dest='export_path',
+        nargs='?',
+        const='__AUTO__',
+        metavar='PATH',
+        help='导出登录态迁移包，可选指定路径',
+    )
+    parser.add_argument(
+        '--import',
+        dest='import_path',
+        metavar='PATH',
+        help='导入登录态迁移包',
+    )
+    parser.add_argument(
+        '--save-current',
+        nargs='?',
+        const='__AUTO__',
+        metavar='NAME',
+        help='非交互存档当前账号，可选指定名称',
+    )
+    parser.add_argument('--refresh', action='store_true', help='实时刷新当前账号使用量后退出')
+    return parser
+
+def run_list_command(json_output: bool) -> int:
+    """执行账号列表命令"""
+    rows = sort_accounts_for_agent(load_live_account_rows(show_progress=False))
+    if json_output:
+        print(json.dumps([serialize_account(row, i) for i, row in enumerate(rows, 1)], ensure_ascii=False, indent=2))
+        return 0
+
+    print_accounts_table(rows, "账号列表（按 5 小时 / 每周余量排序）")
+    return 0
+
+def run_best_command(json_output: bool) -> int:
+    """执行最佳账号命令"""
+    rows = sort_accounts_for_agent(filter_machine_healthy_accounts(load_live_account_rows(show_progress=False)))
+    best = rows[0] if rows else None
+    if json_output:
+        print(json.dumps(serialize_account(best, 1) if best else {}, ensure_ascii=False, indent=2))
+        return 0
+
+    if not best:
+        print("没有可用账号")
+        return 1
+    print_accounts_table([best], "最佳账号")
+    return 0
+
+def run_switch_command(selector: str, json_output: bool) -> int:
+    """执行非交互切换命令"""
+    rows = sort_accounts_for_agent(load_live_account_rows(show_progress=False))
+    target = resolve_account_selector(rows, selector)
+    if not target:
+        message = {'ok': False, 'error': f'未找到账号选择器: {selector}'}
+        print(json.dumps(message, ensure_ascii=False, indent=2) if json_output else message['error'])
+        return 1
+
+    if target.get('is_current'):
+        payload = {'ok': True, 'message': '目标账号已经是当前账号', 'account': serialize_account(target, 1)}
+        print(json.dumps(payload, ensure_ascii=False, indent=2) if json_output else payload['message'])
+        return 0
+
+    switch_path = target.get('switch_path')
+    if not switch_path:
+        payload = {'ok': False, 'error': '目标账号尚未存档，无法切换'}
+        print(json.dumps(payload, ensure_ascii=False, indent=2) if json_output else payload['error'])
+        return 1
+
+    switched = switch_to_account(switch_path)
+    if switched:
+        restart_info = finish_switch_with_restart(quiet=json_output)
+        payload = {
+            'ok': True,
+            'message': '切换成功',
+            'account': serialize_account(target, 1),
+            'restart': restart_info,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2) if json_output else f"切换成功: {target.get('email', '')}")
+        return 0
+
+    payload = {'ok': False, 'error': '切换失败'}
+    print(json.dumps(payload, ensure_ascii=False, indent=2) if json_output else payload['error'])
+    return 1
+
+def run_delete_command(selector: str, json_output: bool) -> int:
+    """执行非交互删除命令"""
+    rows = sort_accounts_for_agent(load_live_account_rows(show_progress=False))
+    target = resolve_account_selector(rows, selector)
+    if not target:
+        payload = {'ok': False, 'error': f'未找到账号选择器: {selector}'}
+        print(json.dumps(payload, ensure_ascii=False, indent=2) if json_output else payload['error'])
+        return 1
+
+    if target.get('is_current'):
+        payload = {'ok': False, 'error': '当前账号不能删除，请先切换到其他账号'}
+        print(json.dumps(payload, ensure_ascii=False, indent=2) if json_output else payload['error'])
+        return 1
+
+    if not target.get('switch_path'):
+        payload = {'ok': False, 'error': '目标账号没有可删除的存档文件'}
+        print(json.dumps(payload, ensure_ascii=False, indent=2) if json_output else payload['error'])
+        return 1
+
+    deleted, deleted_paths = delete_saved_account_artifacts(target)
+    if not deleted:
+        payload = {'ok': False, 'error': '目标账号没有可删除的存档或缓存'}
+        print(json.dumps(payload, ensure_ascii=False, indent=2) if json_output else payload['error'])
+        return 1
+
+    payload = {
+        'ok': True,
+        'message': '删除成功',
+        'account': serialize_account(target, 1),
+        'deleted_paths': deleted_paths,
+    }
+    print(json.dumps(payload, ensure_ascii=False, indent=2) if json_output else f"删除成功: {target.get('email', '')}")
+    return 0
+
+def run_save_current_command(name_arg: str, json_output: bool) -> int:
+    """执行非交互存档当前账号命令"""
+    auth_data = load_current_auth()
+    info = get_account_info(auth_data, str(get_auth_file())) if auth_data else None
+    if not info:
+        payload = {'ok': False, 'error': '当前未登录任何账号'}
+        print(json.dumps(payload, ensure_ascii=False, indent=2) if json_output else payload['error'])
+        return 1
+
+    save_name = info.get('email', 'account') if name_arg == '__AUTO__' else name_arg
+    save_name = save_name or info.get('email', 'account')
+    saved = save_current_auth(save_name)
+    payload = {'ok': saved, 'name': save_name, 'email': info.get('email', '')}
+    if not saved:
+        payload['error'] = '存档失败'
+    print(json.dumps(payload, ensure_ascii=False, indent=2) if json_output else ('存档成功' if saved else '存档失败'))
+    return 0 if saved else 1
+
+def run_refresh_command(json_output: bool) -> int:
+    """执行非交互刷新当前账号命令"""
+    auth_path = get_auth_file()
+    info = refresh_usage_for_auth_path(auth_path)
+    if not info:
+        payload = {'ok': False, 'error': '当前未登录任何账号或无法刷新'}
+        print(json.dumps(payload, ensure_ascii=False, indent=2) if json_output else payload['error'])
+        return 1
+
+    usage_cache = load_usage_cache(info.get('email', ''), info.get('account_id', ''), info.get('record_key', ''))
+    payload = {'ok': True, 'account': serialize_account(info, 1), 'usage': usage_cache or {}}
+    print(json.dumps(payload, ensure_ascii=False, indent=2) if json_output else f"刷新完成: {info.get('email', '')}")
+    return 0
+
+def run_export_command(path_arg: str, json_output: bool) -> int:
+    """执行迁移包导出命令"""
+    output_path = '' if path_arg == '__AUTO__' else path_arg
+    payload = export_migration_archive(output_path)
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif payload.get('ok'):
+        print(f"导出完成: {payload.get('archive_path', '')}")
+        print(f"已写入 {len(payload.get('exported_files', []))} 个文件")
+        for warning in payload.get('warnings', []):
+            print(f"警告: {warning}")
+    else:
+        print(payload.get('error', '导出失败'))
+        for warning in payload.get('warnings', []):
+            print(f"警告: {warning}")
+    return 0 if payload.get('ok') else 1
+
+def run_import_command(path_arg: str, json_output: bool) -> int:
+    """执行迁移包导入命令"""
+    payload = import_migration_archive(path_arg)
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif payload.get('ok'):
+        print(f"导入完成: {payload.get('archive_path', '')}")
+        print(f"恢复备份: {payload.get('backup_dir', '')}")
+        print(f"已恢复 {len(payload.get('imported_files', []))} 个文件")
+        for warning in payload.get('warnings', []):
+            print(f"警告: {warning}")
+    else:
+        print(payload.get('error', '导入失败'))
+        for warning in payload.get('warnings', []):
+            print(f"警告: {warning}")
+    return 0 if payload.get('ok') else 1
+
+def run_noninteractive(args: argparse.Namespace) -> int:
+    """执行非交互 CLI 命令"""
+    if getattr(args, 'export_path', None) is not None:
+        return run_export_command(args.export_path, args.json)
+    if getattr(args, 'import_path', None):
+        return run_import_command(args.import_path, args.json)
+    if args.save_current is not None:
+        return run_save_current_command(args.save_current, args.json)
+    if args.delete:
+        return run_delete_command(args.delete, args.json)
+    if args.switch:
+        return run_switch_command(args.switch, args.json)
+    if args.best:
+        return run_best_command(args.json)
+    if args.refresh:
+        return run_refresh_command(args.json)
+    if args.list or args.json:
+        return run_list_command(args.json)
+    return 0
+
+def main():
+    """主函数"""
+    # 确保目录存在
+    get_accounts_dir().mkdir(parents=True, exist_ok=True)
+    get_usage_cache_dir().mkdir(parents=True, exist_ok=True)
+    apply_default_proxy_env()
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    if any([
+        args.list,
+        args.json,
+        args.best,
+        args.switch,
+        args.delete,
+        getattr(args, 'export_path', None) is not None,
+        getattr(args, 'import_path', None),
+        args.save_current is not None,
+        args.refresh,
+    ]):
+        raise SystemExit(run_noninteractive(args))
+
+    try:
+        view_all_accounts()
+    except KeyboardInterrupt:
+        pass
+
+    print(f"{Colors.GREEN}再见！{Colors.ENDC}")
+
+if __name__ == '__main__':
+    main()

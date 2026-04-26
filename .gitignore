@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local runtime/state with account credentials
+accounts/
+usage_cache/
+backups/
+runtime/
+
+# Local Codex state and migration archives
+.codex
+*.zip
+
+# Editors and OS files
+.DS_Store
+.idea/
+.vscode/
