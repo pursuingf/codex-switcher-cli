@@ -39,7 +39,7 @@ The migration archive includes:
 
 It excludes local sessions, usage cache, runtime files, backups, and `[projects]` / `[projects."/local/path"]` sections from `config.toml`.
 
-For `.bashrc`, only Codex Switcher related shell snippets are migrated, such as `alias csw`, the `codex()` wrapper, and related `clashon` / proxy defaults when present. The importer writes them into a managed `Codex Switcher Migration` block instead of replacing the whole file.
+For `.bashrc`, only Codex Switcher related shell snippets are migrated, such as `alias csw`, the `codex()` wrapper, and related `clashon` / proxy defaults when present. The importer appends them to the end of the target `.bashrc` between `======codexSwitcher======` separator lines instead of replacing the whole file.
 
 Migration archives contain login credentials. Treat them like tokens and do not commit or share them.
 

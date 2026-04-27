@@ -707,22 +707,23 @@ claude() {
     assert "do not migrate" not in fragment
 
 
-def test_apply_bashrc_migration_replaces_managed_block():
+def test_apply_bashrc_migration_appends_separator_block():
     target = '''
 export KEEP_ME=1
 
-# Codex Switcher Migration START
+======codexSwitcher======
 old content
-# Codex Switcher Migration END
+======codexSwitcher======
 '''
     incoming = 'alias csw="codex-switcher"\n'
 
     result = cs.apply_bashrc_migration(target, incoming)
 
     assert "export KEEP_ME=1" in result
-    assert "old content" not in result
+    assert "old content" in result
     assert 'alias csw="codex-switcher"' in result
-    assert result.count("Codex Switcher Migration START") == 1
+    assert result.count("======codexSwitcher======") == 4
+    assert result.rstrip().endswith('======codexSwitcher======')
 
 
 def test_export_migration_archive_includes_filtered_bashrc_fragment(tmp_path, monkeypatch):
@@ -778,5 +779,5 @@ def test_import_migration_archive_applies_bashrc_fragment(tmp_path, monkeypatch)
     assert result["ok"] is True
     bashrc = bashrc_path.read_text(encoding="utf-8")
     assert "export KEEP_ME=1" in bashrc
-    assert "Codex Switcher Migration START" in bashrc
+    assert "======codexSwitcher======" in bashrc
     assert 'alias csw="codex-switcher"' in bashrc

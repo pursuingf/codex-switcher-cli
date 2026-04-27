@@ -287,8 +287,7 @@ def merge_migratable_config(target_content: str, incoming_content: str) -> str:
     parts = [part for part in (incoming_shared, target_project_text) if part]
     return '\n\n'.join(parts) + ('\n' if parts else '')
 
-BASHRC_MIGRATION_START = "# Codex Switcher Migration START"
-BASHRC_MIGRATION_END = "# Codex Switcher Migration END"
+BASHRC_MIGRATION_SEPARATOR = "======codexSwitcher======"
 
 def shell_function_block(lines: List[str], start_index: int) -> Tuple[List[str], int]:
     """提取简单 shell 函数块，返回块内容和结束下标"""
@@ -342,31 +341,22 @@ def build_migratable_bashrc_fragment(content: str) -> str:
     return clean_config_lines(output)
 
 def strip_bashrc_migration_markers(fragment: str) -> str:
-    """移除迁移片段已有的托管标记"""
+    """移除迁移片段已有的隔断标记"""
     lines = [
         line for line in fragment.splitlines()
-        if line.strip() not in {BASHRC_MIGRATION_START, BASHRC_MIGRATION_END}
+        if line.strip() != BASHRC_MIGRATION_SEPARATOR
     ]
     return clean_config_lines(lines)
 
 def apply_bashrc_migration(target_content: str, incoming_fragment: str) -> str:
-    """向 .bashrc 插入或替换 Codex Switcher 迁移托管块"""
+    """向 .bashrc 末尾追加 Codex Switcher 迁移片段"""
     fragment = strip_bashrc_migration_markers(incoming_fragment).strip()
     if not fragment:
         return target_content
 
-    managed_block = f"{BASHRC_MIGRATION_START}\n{fragment}\n{BASHRC_MIGRATION_END}"
-    pattern = re.compile(
-        rf"{re.escape(BASHRC_MIGRATION_START)}.*?{re.escape(BASHRC_MIGRATION_END)}",
-        re.DOTALL,
-    )
-
-    if pattern.search(target_content):
-        result = pattern.sub(managed_block, target_content)
-    else:
-        base = target_content.rstrip()
-        result = f"{base}\n\n{managed_block}" if base else managed_block
-
+    append_block = f"{BASHRC_MIGRATION_SEPARATOR}\n{fragment}\n{BASHRC_MIGRATION_SEPARATOR}"
+    base = target_content.rstrip()
+    result = f"{base}\n\n{append_block}" if base else append_block
     return result.rstrip() + '\n'
 
 def default_migration_archive_path() -> Path:
